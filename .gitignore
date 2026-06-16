@@ -10,3 +10,4 @@ log/
 Log/
 src/yolo_detectors/resource
 src/yolo_detectors/test
+src/yolo_detectors/config

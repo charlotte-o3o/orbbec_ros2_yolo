@@ -18,14 +18,9 @@ setup(
     license='MIT',
     entry_points={
         'console_scripts': [
-            'alien_detection = yolo_detectors.alien_detection_node:main',
-            'pose_detection  = yolo_detectors.pose_detection_node:main',
-            'camera_driver = yolo_detectors.camera_driver_node:main',
-            'alien_yolo = yolo_detectors.alien_yolo_node:main',
-            'pose_yolo = yolo_detectors.pose_yolo_node:main',
             'test_subscriber = yolo_detectors.test_subscriber_node:main',
-            'test_yolo = yolo_detectors.test_yolo_node:main',
-            'test_yolo_pose = yolo_detectors.test_yolo_pose_node:main',
+            'fine_tune_yolo = yolo_detectors.fine_tune_yolo_node:main',
+            'yolo_pose = yolo_detectors.yolo_pose_node:main',
         ],
     },
 )

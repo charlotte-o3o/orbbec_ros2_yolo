@@ -16,10 +16,10 @@ import random
 import numpy as np
 import time
 
-class TestYoloPoseNode(Node):
+class YoloPoseNode(Node):
 
     def __init__(self):
-        super().__init__('test_yolo_pose_node')
+        super().__init__('yolo_pose_node')
 
         self.declare_parameter('model_path',  'weights/yolo26n-pose.pt')
         self.declare_parameter('confidence',  0.50)
@@ -152,7 +152,7 @@ class TestYoloPoseNode(Node):
     
 def main(args=None):
     rclpy.init(args=args)
-    node = TestYoloPoseNode()
+    node = YoloPoseNode()
 
     try:
         rclpy.spin(node)

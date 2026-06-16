@@ -16,10 +16,10 @@ import random
 import numpy as np
 import time
 
-class TestYoloNode(Node):
+class FineTuneYoloNode(Node):
 
     def __init__(self):
-        super().__init__('test_yolo_node')
+        super().__init__('fine_tune_yolo_node')
 
         self.declare_parameter('model_path',  'weights/alien_plushie_v3.pt')
         self.declare_parameter('confidence',  0.50)
@@ -173,7 +173,7 @@ class TestYoloNode(Node):
     
 def main(args=None):
     rclpy.init(args=args)
-    node = TestYoloNode()
+    node = FineTuneYoloNode()
 
     try:
         rclpy.spin(node)

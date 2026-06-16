@@ -1,7 +1,8 @@
-*.pt
 *.sh
 *.avi
 cyclonedds_host.xml
+yolo26n-pose.pt
+yolo26n.pt
 
 build/
 captures_videos/
@@ -15,3 +16,9 @@ src/yolo_detectors/config
 src/yolo_detectors/yolo_detectors/build
 src/yolo_detectors/yolo_detectors/install
 src/yolo_detectors/yolo_detectors/log
+
+alien_detection_node.py
+alien_yolo_node.py
+camera_driver_node.py
+pose_detection_node.py
+pose_yolo_node.py

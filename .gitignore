@@ -1,5 +1,6 @@
 *.pt
 *.sh
+*.avi
 cyclonedds_host.xml
 
 build/

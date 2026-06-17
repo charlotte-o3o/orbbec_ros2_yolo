@@ -15,6 +15,8 @@ import message_filters
 import random
 import numpy as np
 import time
+from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
+from geometry_msgs.msg import PoseWithCovariance, Pose, Point
 
 class FineTuneYoloNode(Node):
 
@@ -55,6 +57,12 @@ class FineTuneYoloNode(Node):
             '/orbbec_external/depth/image_raw'
         )
 
+        self.pub_detections = self.create_publisher(
+            Detection2DArray,
+            '/yolo_detected_objects',
+            10
+        )
+
         # Config du synchroniseur temporel approximatif
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [self.sub_color, self.sub_depth],
@@ -83,6 +91,9 @@ class FineTuneYoloNode(Node):
 
             # Hauteur et largeur de l'image de profondeur pour éviter les débordements de pixels
             h, w = cv_depth_image.shape[:2]
+
+            msg_array = Detection2DArray()
+            msg_array.header = color_msg.header
             
             if boxes is not None:
                 for box in boxes:
@@ -131,8 +142,22 @@ class FineTuneYoloNode(Node):
                         if len(self.distance_history) > self.max_history:                       
                             self.distance_history.pop(0)  
 
-                        print(f"Dist. history : {self.distance_history}")
+                        #print(f"Dist. history : {self.distance_history}")
                         distance = float(np.mean(self.distance_history)) 
+
+                    detection = Detection2D()
+                    detection.bbox.center.position.x = float(x_center)
+                    detection.bbox.center.position.y = float(y_center)
+                    detection.bbox.size_x = float(x2 - x1)
+                    detection.bbox.size_y = float(y2 - y1)
+
+                    hyp = ObjectHypothesisWithPose() # Hypothèse sur l'objet détecté et sa distance dans l'id de la pose
+                    hyp.hypothesis.class_id = str(label) # Nom ou id de l'objet (alien plushie)
+                    hyp.hypothesis.score = confie / 100.0  # Confiance de la détection (0.0 à 1.0)
+                    hyp.pose.pose.position.z = float(distance)  # Distance en mètres dans la coord z de la pose
+
+                    detection.results.append(hyp)
+                    msg_array.detections.append(detection)
                     
                     if distance == 0:
                         text_dist = "---"
@@ -144,6 +169,8 @@ class FineTuneYoloNode(Node):
                     cv2.circle(annotated_image, (x_center, y_center), 4, (0, 0, 255), -1)
                     cv2.putText(annotated_image, custom_label, (x1, y1-10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.box_color, 2)
+                    
+            self.pub_detections.publish(msg_array)
 
             cv2.putText(
                 annotated_image, 

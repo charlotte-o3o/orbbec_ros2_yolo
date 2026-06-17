@@ -16,3 +16,5 @@ src/yolo_detectors/config
 src/yolo_detectors/yolo_detectors/build
 src/yolo_detectors/yolo_detectors/install
 src/yolo_detectors/yolo_detectors/log
+
+test_subscriber_node.py

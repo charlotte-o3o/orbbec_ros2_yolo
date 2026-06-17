@@ -12,9 +12,9 @@ import cv2
 from cv_bridge import CvBridge
 from ultralytics import YOLO
 import message_filters
-import random
 import numpy as np
 import time
+from lancer_interfaces.msg import HumanPoseArray, HumanPose, Keypoint2D
 
 class YoloPoseNode(Node):
 
@@ -49,6 +49,12 @@ class YoloPoseNode(Node):
             '/orbbec_external/depth/image_raw'
         )
 
+        self.pub_pose = self.create_publisher(
+            HumanPoseArray,
+            '/yolo_detected_poses',
+            10
+        )
+
         # Config du synchroniseur temporel approximatif
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [self.sub_color, self.sub_depth],
@@ -80,6 +86,9 @@ class YoloPoseNode(Node):
 
             # Hauteur et largeur de l'image de profondeur pour éviter les débordements de pixels
             h, w = cv_depth_image.shape[:2]
+
+            msg_pose_array = HumanPoseArray()
+            msg_pose_array.header = color_msg.header # Copie du timestamp de synchronisation
             
             if boxes is not None and keypoints_object is not None and cv_depth_image is not None:
 
@@ -106,6 +115,24 @@ class YoloPoseNode(Node):
 
                     distance_box_m = cv_depth_image[cy, cx] / 1000.0
 
+                    human_pose_msg = HumanPose()
+                    human_pose_msg.id = int(i) # ID de la personne détectée
+
+                    # Remplissage du centre 3D de l'humain (X et Y en pixel, Z en mètres)
+                    human_pose_msg.position_centre_3d.x = float(cx)
+                    human_pose_msg.position_centre_3d.y = float(cy)
+                    human_pose_msg.position_centre_3d.z = float(distance_box_m)
+
+                    # Remplissage de TOUS les 17 keypoints de la personne dans la liste
+                    for kp in person_kpts:
+                        kp_msg = Keypoint2D()
+                        kp_msg.x = float(kp[0])
+                        kp_msg.y = float(kp[1])
+                        kp_msg.confidence = float(kp[2]) # Score d'invisibilité/visibilité du point
+                        human_pose_msg.keypoints.append(kp_msg)
+
+                    msg_pose_array.poses.append(human_pose_msg)
+
                     if distance_box_m > 0:
                         text_dist = f"{distance_box_m:.2f}m"
                     else:
@@ -115,6 +142,8 @@ class YoloPoseNode(Node):
                     cv2.putText(annotated_image, text_dist, (cx + 10, cy - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                     
+            self.pub_pose.publish(msg_pose_array)
+
             cv2.putText(
                 annotated_image, 
                 f"Person(s): {num_persons}", 

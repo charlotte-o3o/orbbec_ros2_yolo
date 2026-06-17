@@ -87,6 +87,10 @@ If the topics stop being published, stop the Docker container, unplug the camera
 
 - ROS 2
 - `cv_bridge`, `message_filters`
+```bash
+sudo apt install ros-<distro>-cv-bridge
+sudo apt install ros-<distro>-message-filters
+```
 - OpenCV (`opencv-python`)
 - `ultralytics` (YOLO)
 - An Orbbec camera publishing synchronized color/depth image topics

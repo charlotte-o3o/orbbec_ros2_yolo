@@ -6,7 +6,7 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;*.warning=false"
 
 from rclpy.node import Node
 import message_filters
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 import rclpy
 import cv2
 from cv_bridge import CvBridge
@@ -33,6 +33,12 @@ class FineTuneYoloNode(Node):
         self.max_history          = self.get_parameter('max_history').value
         self.max_jump             = self.get_parameter('max_jump').value
 
+        self.fx = 616.0  # Focal length in pixels (x-axis)
+        self.fy = 616.0  # Focal length in pixels (y-axis)
+        self.cx = 320.0  # Principal point x-coordinate (image center)      
+        self.cy = 240.0  # Principal point y-coordinate (image center)
+        self.has_camera_info = False  # Flag to check if camera info has been received
+
         self.get_logger().info("*** YOLO Node Launched successfully ***")
 
         # Initialisation du convertisseur CvBridge
@@ -44,6 +50,13 @@ class FineTuneYoloNode(Node):
         self.model = YOLO(self.model_path)
         self.get_logger().info("Model loaded successfully")
 
+
+        self.sub_info = self.create_subscription(
+            CameraInfo,
+            '/orbbec_external/color/camera_info',
+            self.camera_info_callback,
+            10
+        )
 
         self.sub_color = message_filters.Subscriber(
             self,
@@ -72,6 +85,19 @@ class FineTuneYoloNode(Node):
 
         # Fonction callback pour les deux messages synchronisés
         self.sync.registerCallback(self.synchronized_callback)
+        
+    def camera_info_callback(self, msg: CameraInfo):
+
+        if not self.has_camera_info:
+            self.fx = msg.k[0]  # Focal length in pixels (x-axis)
+            self.fy = msg.k[4]  # Focal length in pixels (y-axis)
+            self.cx = msg.k[2]  # Principal point x-coordinate (image center)      
+            self.cy = msg.k[5]  # Principal point y-coordinate (image center)
+            self.has_camera_info = True
+
+            self.get_logger().info(f"Camera info received: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
+
+            self.destroy_subscription(self.sub_info)  # Unsubscribe after receiving camera info
 
     def synchronized_callback(self, color_msg, depth_msg):
         try:
@@ -99,7 +125,7 @@ class FineTuneYoloNode(Node):
                 for box in boxes:
                     class_id = int(box.cls[0])
                     label = self.model.names[class_id]
-                    confie = float(box.conf[0]) * 100
+                    confidence = float(box.conf[0]) * 100
                     x1, y1, x2, y2  = map(int, box.xyxy[0])
 
                     x_center = int((x1 + x2) / 2)
@@ -145,6 +171,12 @@ class FineTuneYoloNode(Node):
                         #print(f"Dist. history : {self.distance_history}")
                         distance = float(np.mean(self.distance_history)) 
 
+                    if distance > 0:
+                        x_meters = ((x_center - self.cx) * distance) / self.fx
+                        y_meters = ((y_center - self.cy) * distance) / self.fy
+                    else:
+                        x_meters, y_meters = None, None
+
                     detection = Detection2D()
                     detection.bbox.center.position.x = float(x_center)
                     detection.bbox.center.position.y = float(y_center)
@@ -153,22 +185,29 @@ class FineTuneYoloNode(Node):
 
                     hyp = ObjectHypothesisWithPose() # Hypothèse sur l'objet détecté et sa distance dans l'id de la pose
                     hyp.hypothesis.class_id = str(label) # Nom ou id de l'objet (alien plushie)
-                    hyp.hypothesis.score = confie / 100.0  # Confiance de la détection (0.0 à 1.0)
+                    hyp.hypothesis.score = confidence / 100.0  # Confiance de la détection (0.0 à 1.0)
+                    hyp.pose.pose.position.x = float(x_meters) if x_meters is not None else 0.0
+                    hyp.pose.pose.position.y = float(y_meters) if y_meters is not None else 0.0
                     hyp.pose.pose.position.z = float(distance)  # Distance en mètres dans la coord z de la pose
 
                     detection.results.append(hyp)
                     msg_array.detections.append(detection)
                     
-                    if distance == 0:
-                        text_dist = "---"
+                    if distance > 0:
+                        text_dist = f"Z: {distance:.2f}m"
                     else:
-                        text_dist = f"{distance:.2f}m"
+                        text_dist = "Z: ---"
 
-                    custom_label = f"{label} ({confie:.1f}%) : {text_dist}"
+                    if x_meters is not None and y_meters is not None:
+                        text_coord = f"X: {x_meters:.2f}m, Y: {y_meters:.2f}m"
+                    else:
+                        text_coord = "X: ---, Y: ---"
+
+                    custom_label = f"{label} ({confidence:.1f}%) | {text_coord}, {text_dist}"
                     cv2.rectangle(annotated_image, (x1,y1), (x2,y2), self.box_color, 2)
                     cv2.circle(annotated_image, (x_center, y_center), 4, (0, 0, 255), -1)
                     cv2.putText(annotated_image, custom_label, (x1, y1-10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.box_color, 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, self.box_color, 2)
                     
             self.pub_detections.publish(msg_array)
 

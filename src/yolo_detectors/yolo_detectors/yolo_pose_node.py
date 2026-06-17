@@ -6,7 +6,7 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;*.warning=false"
 
 from rclpy.node import Node
 import message_filters
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 import rclpy
 import cv2
 from cv_bridge import CvBridge
@@ -27,6 +27,12 @@ class YoloPoseNode(Node):
         self.model_path           = self.get_parameter('model_path').value
         self.confidence_threshold = self.get_parameter('confidence').value
 
+        self.fx = 616.0  # Focal length in pixels (x-axis)
+        self.fy = 616.0  # Focal length in pixels (y-axis)
+        self.cx = 320.0  # Principal point x-coordinate (image center)      
+        self.cy = 240.0  # Principal point y-coordinate (image center)
+        self.has_camera_info = False  # Flag to check if camera info has been received
+
         self.get_logger().info("*** YOLO-Pose Node Launched successfully ***")
 
         # Initialisation du convertisseur CvBridge
@@ -36,6 +42,12 @@ class YoloPoseNode(Node):
         self.model = YOLO(self.model_path)
         self.get_logger().info("Model loaded successfully")
 
+        self.sub_info = self.create_subscription(
+            CameraInfo,
+            '/orbbec_external/color/camera_info',
+            self.camera_info_callback,
+            10
+        )
 
         self.sub_color = message_filters.Subscriber(
             self,
@@ -64,6 +76,19 @@ class YoloPoseNode(Node):
 
         # Fonction callback pour les deux messages synchronisés
         self.sync.registerCallback(self.synchronized_callback)
+
+    def camera_info_callback(self, msg: CameraInfo):
+
+        if not self.has_camera_info:
+            self.fx = msg.k[0]  # Focal length in pixels (x-axis)
+            self.fy = msg.k[4]  # Focal length in pixels (y-axis)
+            self.cx = msg.k[2]  # Principal point x-coordinate (image center)      
+            self.cy = msg.k[5]  # Principal point y-coordinate (image center)
+            self.has_camera_info = True
+
+            self.get_logger().info(f"Camera info received: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
+
+            self.destroy_subscription(self.sub_info)  # Unsubscribe after receiving camera info
 
     def synchronized_callback(self, color_msg, depth_msg):
         try:
@@ -104,23 +129,29 @@ class YoloPoseNode(Node):
                     x_l_shoulder, y_l_shoulder, conf_l = person_kpts[5] # Épaule gauche
                     x_r_shoulder, y_r_shoulder, conf_r = person_kpts[6] # Épaule droite
 
-                    cx = int((x_l_shoulder + x_r_shoulder) / 2)
-                    cy = int((y_l_shoulder + y_r_shoulder) / 2)
+                    x_mean_shoulder = int((x_l_shoulder + x_r_shoulder) / 2)
+                    y_mean_shoulder = int((y_l_shoulder + y_r_shoulder) / 2)
 
-                    if cx == 0 and cy == 0:
+                    if x_mean_shoulder == 0 and y_mean_shoulder == 0:
                         continue
 
-                    cx = max(0, min(cx, w - 1))
-                    cy = max(0, min(cy, h - 1))
+                    x_mean_shoulder = max(0, min(x_mean_shoulder, w - 1))
+                    y_mean_shoulder = max(0, min(y_mean_shoulder, h - 1))
 
-                    distance_box_m = cv_depth_image[cy, cx] / 1000.0
+                    distance_box_m = cv_depth_image[y_mean_shoulder, x_mean_shoulder] / 1000.0
+
+                    if distance_box_m > 0:
+                        x_meters = ((x_mean_shoulder - self.cx) * distance_box_m) / self.fx
+                        y_meters = ((y_mean_shoulder - self.cy) * distance_box_m) / self.fy
+                    else:
+                        x_meters, y_meters = None, None
 
                     human_pose_msg = HumanPose()
                     human_pose_msg.id = int(i) # ID de la personne détectée
 
                     # Remplissage du centre 3D de l'humain (X et Y en pixel, Z en mètres)
-                    human_pose_msg.position_centre_3d.x = float(cx)
-                    human_pose_msg.position_centre_3d.y = float(cy)
+                    human_pose_msg.position_centre_3d.x = float(x_meters) if x_meters is not None else 0.0
+                    human_pose_msg.position_centre_3d.y = float(y_meters) if y_meters is not None else 0.0  
                     human_pose_msg.position_centre_3d.z = float(distance_box_m)
 
                     # Remplissage de TOUS les 17 keypoints de la personne dans la liste
@@ -134,13 +165,19 @@ class YoloPoseNode(Node):
                     msg_pose_array.poses.append(human_pose_msg)
 
                     if distance_box_m > 0:
-                        text_dist = f"{distance_box_m:.2f}m"
+                        text_dist = f"Z: {distance_box_m:.2f}m"
                     else:
-                        text_dist = "Dist. inconnue"
+                        text_dist = "Z: ---"
 
-                    cv2.circle(annotated_image, (cx, cy), 5, (0, 0, 255), -1)
-                    cv2.putText(annotated_image, text_dist, (cx + 10, cy - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    if x_meters is not None and y_meters is not None:
+                        text_coord = f"X: {x_meters:.2f}m, Y: {y_meters:.2f}m"
+                    else:
+                        text_coord = "X: ---, Y: ---"
+
+                    coord_label = f"({text_coord}, {text_dist})"
+                    cv2.circle(annotated_image, (x_mean_shoulder, y_mean_shoulder), 5, (0, 0, 255), -1)
+                    cv2.putText(annotated_image, coord_label, (x_mean_shoulder + 10, y_mean_shoulder - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
                     
             self.pub_pose.publish(msg_pose_array)
 

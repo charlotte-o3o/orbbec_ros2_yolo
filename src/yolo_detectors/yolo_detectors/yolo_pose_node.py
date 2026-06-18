@@ -243,7 +243,7 @@ class YoloPoseNode(Node):
                 2
                 )
             
-            cv2.imshow("BGR Image with YOLO-Pose", annotated_image)
+            #cv2.imshow("BGR Image with YOLO-Pose", annotated_image)
 
             depth_vis = cv2.normalize(cv_depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
             depth_colormap = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)

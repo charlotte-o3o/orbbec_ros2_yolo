@@ -22,6 +22,9 @@ setup(
             'fine_tune_yolo = yolo_detectors.fine_tune_yolo_node:main',
             'yolo_pose = yolo_detectors.yolo_pose_node:main',
             'yolo_world = yolo_detectors.yolo_world_node:main',
+            'collect_data = yolo_detectors.collect_data_node:main',
+            'inference_stgcn = yolo_detectors.inference_stgcn_node:main',
+            'double_detection = yolo_detectors.double_detection_node:main',
         ],
     },
 )

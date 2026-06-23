@@ -19,17 +19,10 @@ src/yolo_detectors/yolo_detectors/build
 src/yolo_detectors/yolo_detectors/install
 src/yolo_detectors/yolo_detectors/log
 dataset/
-<<<<<<< HEAD
-=======
 data/
->>>>>>> dev
 
 test_subscriber_node.py
 yolo_world_node.py
 train_stgcn.py
 inference_stgcn_node.py
-<<<<<<< HEAD
 collect_data_node.py
-=======
-collect_data_node.py
->>>>>>> dev

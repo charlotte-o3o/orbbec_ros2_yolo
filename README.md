@@ -5,7 +5,7 @@ ROS 2 nodes for running YOLO26 pose estimation and a fine-tuned YOLO26 detector 
 ## Nodes
 
 - **`yolo_pose_node`** — runs YOLO26 pose estimation on the color stream, overlays skeleton keypoints, and computes the distance to each detected person (from shoulder midpoint) using the synchronized depth image.
-- **`fine_tune_yolo_node`** — runs a custom fine-tuned YOLO26 model (e.g. `alien_plushie_v3.pt`), draws bounding boxes with class/confidence, and computes a smoothed distance estimate per detection using a filtered depth patch. The model used is a custom model fine-tuned by myself, available in the [`weights/`](./weights) folder.
+- **`fine_tune_yolo_node`** — runs a custom fine-tuned YOLO26 model (e.g. `alien_plushie_v4.pt`), draws bounding boxes with class/confidence, and computes a smoothed distance estimate per detection using a filtered depth patch. The model used is a custom model fine-tuned by myself, available in the [`weights/`](./weights) folder.
 
 Both nodes subscribe to:
 - `/orbbec_external/color/image_raw`
@@ -78,10 +78,10 @@ If the topics stop being published, stop the Docker container, unplug the camera
 
 | Parameter | Default | Description |
 |---|---|---|
-| `model_path` | `weights/alien_plushie_v3.pt` | Path to the fine-tuned YOLO model weights |
+| `model_path` | `weights/alien_plushie_v4.pt` | Path to the fine-tuned YOLO model weights |
 | `confidence` | `0.50` | Minimum detection confidence |
 | `max_history` | `5` | Number of past distance readings used for smoothing |
-| `max_jump` | `0.5` | Maximum allowed distance jump (m) between consecutive frames before it's rejected as noise |
+| `max_jump` | `2` | Maximum allowed distance jump (m) between consecutive frames before it's rejected as noise |
 
 ## Requirements
 

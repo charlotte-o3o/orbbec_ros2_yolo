@@ -186,13 +186,15 @@ class YoloPoseNode(Node):
                     if distance_box_m > 0:
                         x_meters = ((x_mean_shoulder - self.cx) * distance_box_m) / self.fx
                         y_meters = ((y_mean_shoulder - self.cy) * distance_box_m) / self.fy
+                        text_coord = f"X: {x_meters:.2f}m, Y: {y_meters:.2f}m, Z: {distance_box_m:.2f}m"
                     else:
                         x_meters, y_meters = None, None
+                        text_coord = "X: ---, Y: ---, Z: ---"
 
                     human_pose_msg = HumanPose()
                     human_pose_msg.id = int(i) # ID de la personne détectée
 
-                    # Remplissage du centre 3D de l'humain (X et Y en pixel, Z en mètres)
+                    # Remplissage du centre 3D de l'humain (X, Y, Z en mètres)
                     human_pose_msg.position_centre_3d.x = float(x_meters) if x_meters is not None else 0.0
                     human_pose_msg.position_centre_3d.y = float(y_meters) if y_meters is not None else 0.0  
                     human_pose_msg.position_centre_3d.z = float(distance_box_m)
@@ -207,19 +209,8 @@ class YoloPoseNode(Node):
 
                     msg_pose_array.poses.append(human_pose_msg)
 
-                    if distance_box_m > 0:
-                        text_dist = f"Z: {distance_box_m:.2f}m"
-                    else:
-                        text_dist = "Z: ---"
-
-                    if x_meters is not None and y_meters is not None:
-                        text_coord = f"X: {x_meters:.2f}m, Y: {y_meters:.2f}m"
-                    else:
-                        text_coord = "X: ---, Y: ---"
-
-                    coord_label = f"({text_coord}, {text_dist})"
                     cv2.circle(annotated_image, (x_mean_shoulder, y_mean_shoulder), 5, (0, 0, 255), -1)
-                    cv2.putText(annotated_image, coord_label, (x_mean_shoulder + 10, y_mean_shoulder - 10),
+                    cv2.putText(annotated_image, text_coord, (x_mean_shoulder + 10, y_mean_shoulder - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
                     
             self.pub_pose.publish(msg_pose_array)

@@ -25,6 +25,10 @@ setup(
             'collect_data = yolo_detectors.collect_data_node:main',
             'inference_stgcn = yolo_detectors.inference_stgcn_node:main',
             'double_detection = yolo_detectors.double_detection_node:main',
+<<<<<<< HEAD
+=======
+            'mathematical_throw_detection = yolo_detectors.mathematical_throw_detection_node:main'
+>>>>>>> dev
         ],
     },
 )

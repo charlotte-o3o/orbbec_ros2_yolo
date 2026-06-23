@@ -16,17 +16,16 @@ import random
 import numpy as np
 import time
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
-from geometry_msgs.msg import PoseWithCovariance, Pose, Point
 
 class FineTuneYoloNode(Node):
 
     def __init__(self):
         super().__init__('fine_tune_yolo_node')
 
-        self.declare_parameter('model_path',  'weights/alien_plushie_v3.pt')
+        self.declare_parameter('model_path',  'weights/alien_plushie_v4.pt')
         self.declare_parameter('confidence',  0.50)
         self.declare_parameter('max_history', 5)
-        self.declare_parameter('max_jump',    0.5)
+        self.declare_parameter('max_jump',    2.0)
 
         self.model_path           = self.get_parameter('model_path').value
         self.confidence_threshold = self.get_parameter('confidence').value
@@ -39,12 +38,14 @@ class FineTuneYoloNode(Node):
         self.cy = 240.0  # Principal point y-coordinate (image center)
         self.has_camera_info = False  # Flag to check if camera info has been received
 
-        self.get_logger().info("*** YOLO Node Launched successfully ***")
+        self.smoothed_distance = None
 
-        # Initialisation du convertisseur CvBridge
+        # --- Initialisation du convertisseur CvBridge
         self.bridge = CvBridge()
         self.distance_history: list[float] = []
         self.box_color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
+
+        self.get_logger().info("*** YOLO Node Launched successfully ***")
 
         self.get_logger().info(f"Model loading : {self.model_path}...")
         self.model = YOLO(self.model_path)
@@ -76,14 +77,14 @@ class FineTuneYoloNode(Node):
             10
         )
 
-        # Config du synchroniseur temporel approximatif
+        # --- Config du synchroniseur temporel approximatif
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [self.sub_color, self.sub_depth],
             queue_size=10,
             slop=0.05
         )
 
-        # Fonction callback pour les deux messages synchronisés
+        # --- Fonction callback pour les deux messages synchronisés
         self.sync.registerCallback(self.synchronized_callback)
         
     def camera_info_callback(self, msg: CameraInfo):
@@ -115,7 +116,7 @@ class FineTuneYoloNode(Node):
             annotated_image = cv_color_image.copy()
             boxes = results[0].boxes
 
-            # Hauteur et largeur de l'image de profondeur pour éviter les débordements de pixels
+            # --- Hauteur et largeur de l'image de profondeur pour éviter les débordements de pixels
             h, w = cv_depth_image.shape[:2]
 
             msg_array = Detection2DArray()
@@ -135,8 +136,10 @@ class FineTuneYoloNode(Node):
 
                     #distance_mm = cv_depth_image[y_center, x_center]
 
-                    margin_x = int((x2 - x1) * 0.35)                         
-                    margin_y = int((y2 - y1) * 0.35)     
+                    # --- Valeur max pour la marge : 0.5 => pixel central uniquement
+                    # --- 0.375 => 25% de la BB d'origine
+                    margin_x = int((x2 - x1) * 0.375)                         
+                    margin_y = int((y2 - y1) * 0.375)     
 
                     y1_p = max(0, y1 + margin_y)  
                     y2_p = min(cv_depth_image.shape[0], y2 - margin_y)    
@@ -170,12 +173,15 @@ class FineTuneYoloNode(Node):
 
                         #print(f"Dist. history : {self.distance_history}")
                         distance = float(np.mean(self.distance_history)) 
+                   
 
                     if distance > 0:
                         x_meters = ((x_center - self.cx) * distance) / self.fx
                         y_meters = ((y_center - self.cy) * distance) / self.fy
+                        text_coord = f"X: {x_meters:.2f}m, Y: {y_meters:.2f}m, Z: {distance:.2f}m"
                     else:
                         x_meters, y_meters = None, None
+                        text_coord = "X: ---, Y: ---, Z: ---"
 
                     detection = Detection2D()
                     detection.bbox.center.position.x = float(x_center)
@@ -190,24 +196,26 @@ class FineTuneYoloNode(Node):
                     hyp.pose.pose.position.y = float(y_meters) if y_meters is not None else 0.0
                     hyp.pose.pose.position.z = float(distance)  # Distance en mètres dans la coord z de la pose
 
-                    detection.results.append(hyp)
-                    msg_array.detections.append(detection)
                     
-                    if distance > 0:
-                        text_dist = f"Z: {distance:.2f}m"
-                    else:
-                        text_dist = "Z: ---"
-
-                    if x_meters is not None and y_meters is not None:
-                        text_coord = f"X: {x_meters:.2f}m, Y: {y_meters:.2f}m"
-                    else:
-                        text_coord = "X: ---, Y: ---"
-
-                    custom_label = f"{label} ({confidence:.1f}%) | {text_coord}, {text_dist}"
+                    msg_array.detections.append(detection)
+                    detection.results.append(hyp)
+                    
+                    custom_label = f"{label} ({confidence:.1f}%) | {text_coord}"
                     cv2.rectangle(annotated_image, (x1,y1), (x2,y2), self.box_color, 2)
                     cv2.circle(annotated_image, (x_center, y_center), 4, (0, 0, 255), -1)
                     cv2.putText(annotated_image, custom_label, (x1, y1-10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, self.box_color, 2)
+                    
+                    (tw, th), _ = cv2.getTextSize(f"{distance:.2f} m", cv2.FONT_HERSHEY_SIMPLEX, 10.0, 14)           
+                    tx = 30                                                            
+                    ty = h - 30                                         
+                    overlay = annotated_image.copy() 
+                                        
+                    cv2.rectangle(overlay, (tx - 10, ty - th - 10),              
+                                (tx + tw + 10, ty + 10), (0, 0, 0), -1)        
+                    cv2.addWeighted(overlay, 0.5, annotated_image, 0.5, 0, annotated_image)                             
+                    cv2.putText(annotated_image, f"{distance:.2f} m", (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 
+                                10.0, (0, 255, 0), 14, cv2.LINE_AA) 
                     
             self.pub_detections.publish(msg_array)
 

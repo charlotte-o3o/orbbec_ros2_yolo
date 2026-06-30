@@ -124,7 +124,7 @@ class LSTMNode(Node):
         self.model = ThrowLSTM(input_size=6, num_classes=2).to(self.device)
         
         # Définis ici le chemin exact vers ton fichier throw_lstm.pth
-        model_path = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "weights", "throw_lstm_v7.pth")
+        model_path = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "weights", "throw_lstm_v8.pth")
         
         try:
             # Chargement des poids

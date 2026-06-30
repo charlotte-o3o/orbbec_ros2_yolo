@@ -111,7 +111,7 @@ class LSTMNode(Node):
         self.previous_object_center_meters = None
         self.previous_object_timestamp = None
 
-        self.cooldown_duration = .0   
+        self.cooldown_duration = 3.0   
         self.last_throw_trigger_time = 0.0 
         
         self.false_frame_counter = 0      

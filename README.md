@@ -92,7 +92,7 @@ If the topics stop being published, stop the Docker container, unplug the camera
 | `model_path` | `weights/alien_plushie_v4.pt` | Path to the fine-tuned YOLO model weights |
 | `confidence` | `0.50` | Minimum detection confidence |
 | `max_history` | `5` | Number of past distance readings used for smoothing |
-| `max_jump` | `0.5` | Maximum allowed distance jump (m) between consecutive frames before it's rejected as noise |
+| `max_jump` | `2.0` | Maximum allowed distance jump (m) between consecutive frames before it's rejected as noise |
 
 ### `lstm_node`
 
@@ -104,7 +104,7 @@ If the topics stop being published, stop the Docker container, unplug the camera
 | `num_classes` | `2` | Number of output classes (throw / no throw) |
 | `confidence threshold` | `0.85` | Minimum softmax confidence required to classify a frame as "throw" |
 | `max_false_frames_allowed` | `10` | Number of consecutive non-throw frames required before the throw state is officially closed (debounce) |
-| `cooldown_duration` | `0.0` s | Minimum time between two consecutive throw triggers, to avoid flickering re-triggers |
+| `cooldown_duration` | `3.0` s | Minimum time between two consecutive throw triggers, to avoid flickering re-triggers |
 | `save_distance_mode` | `True` | If enabled, logs per-frame object/wrist distances to a timestamped CSV file under `data/csv_distances/` |
 | `record_mode` | `True` | If enabled, records the annotated video stream to `data/captures_videos/` |
 

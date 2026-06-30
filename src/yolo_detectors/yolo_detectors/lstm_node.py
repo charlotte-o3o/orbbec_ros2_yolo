@@ -16,11 +16,28 @@ import cv2
 import random
 import csv
 import time
+import torch
+import torch.nn as nn
 
-class MathematicalThrowDetectionNode(Node):
+class ThrowLSTM(nn.Module):
+    def __init__(self, input_size=3, hidden_size=64, num_layers=2, num_classes=3):
+        super(ThrowLSTM, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, num_classes)
+        
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.fc(out[:, -1, :])
+        return out
+
+class LSTMNode(Node):
 
     def __init__(self):
-        super().__init__('mathematical_throw_detection_node')
+        super().__init__('lstm_node')
 
         self.get_logger().info("*** Mathematical Throw Detection Node Launched ***")
 
@@ -42,7 +59,7 @@ class MathematicalThrowDetectionNode(Node):
         self.cy = 240.0  # Principal point y-coordinate (image center)
         self.has_camera_info = False  # Flag to check if camera info has been received
 
-        self.frame_count = 0
+        self.frame_count = 1
 
         self.start_time = time.time()
         self.timestamp_csv = time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -85,13 +102,39 @@ class MathematicalThrowDetectionNode(Node):
             (11, 13), (13, 15), (12, 14), (14, 16)    
         ]
 
-        self.frame_history_momentum = [] # Buffer pour mémoriser les x dernières frames
-        self.max_momentum_history = 20
-        self.frame_history_throw = []
-        self.max_throw_history = 10
-        self.momentum_detected = False
+        self.sequence_length = 20
+        self.lstm_buffer = []
+        self.last_features = None
         self.throw_detected = False
-        self.last_momentum_time = 0.0
+        self.previous_throw_detected = False
+        self.throw_coordinates = None
+        self.previous_object_center_meters = None
+        self.previous_object_timestamp = None
+
+        self.cooldown_duration = .0   
+        self.last_throw_trigger_time = 0.0 
+        
+        self.false_frame_counter = 0      
+        self.max_false_frames_allowed = 10
+
+        # Détecter si on a une carte graphique NVIDIA, sinon utiliser le processeur
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Instanciation de l'architecture (attention, input_size=3 comme pour l'entraînement)
+        self.model = ThrowLSTM(input_size=6, num_classes=2).to(self.device)
+        
+        # Définis ici le chemin exact vers ton fichier throw_lstm.pth
+        model_path = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "weights", "throw_lstm_v7.pth")
+        
+        try:
+            # Chargement des poids
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            # CRUCIAL : Passer le modèle en mode "évaluation" (désactive l'apprentissage)
+            self.model.eval() 
+            self.get_logger().info(f"LSTM model loaded successfully on {self.device} !")
+        except Exception as e:
+            self.get_logger().error(f"Failed to load LSTM model : {e}")
+            raise e
 
         self.sub_info = self.create_subscription(
             CameraInfo,
@@ -152,6 +195,8 @@ class MathematicalThrowDetectionNode(Node):
             annotated_image = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
             cv_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
 
+            if annotated_image is not None:
+                h_color, w_color = annotated_image.shape[:2]
             if cv_depth_image is not None:
                 h, w = cv_depth_image.shape[:2]
 
@@ -324,111 +369,125 @@ class MathematicalThrowDetectionNode(Node):
                     cv2.putText(annotated_image, f"{right_dist_m:.3f} m", (int(right_line_center[0]) + 1, int(right_line_center[1]) + 1),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                     
+
+                    
+            #########################################################
+            #                                                       #
+            #                         LSTM                          #
+            #                                                       #
+            #########################################################   
+
+
+                   
             if current_obj_z is not None and current_left_dist is not None and current_right_dist is not None:
-                if current_left_dist < current_right_dist:
-                    holding_dist = current_left_dist
-                    non_holding_dist = current_right_dist
-                else:
-                    holding_dist = current_right_dist
-                    non_holding_dist = current_left_dist
+                    
+                    # 1. Position actuelle (3 features)
+                    current_features = [current_obj_z, current_left_dist, current_right_dist]
+                    
+                    # 2. Calcul des deltas (Vitesse)
+                    if self.last_features is None:
+                        # Première frame du nœud : pas d'historique, delta = 0
+                        delta_features = [0.0, 0.0, 0.0]
+                    else:
+                        # Différence avec la frame précédente
+                        delta_features = [
+                            current_features[0] - self.last_features[0],
+                            current_features[1] - self.last_features[1],
+                            current_features[2] - self.last_features[2]
+                        ]
+                    
+                    # On sauvegarde la position actuelle pour la frame suivante
+                    self.last_features = current_features
+                    
+                    # Concaténation : On fusionne positions + vitesses -> 6 features
+                    full_6_features = current_features + delta_features
+                    
+                    # 3. Gestion du buffer
+                    self.lstm_buffer.append(full_6_features)
+                    if len(self.lstm_buffer) > self.sequence_length:
+                        self.lstm_buffer.pop(0)
 
-                vitesse_inst_obj = 0.0
-                vitesse_inst_holding = 0.0
+                    # 4. Inférence
+                    if len(self.lstm_buffer) == self.sequence_length:
+                        input_tensor = torch.tensor([self.lstm_buffer], dtype=torch.float32).to(self.device)
+                        
+                        with torch.no_grad():
+                            outputs = self.model(input_tensor)
+                            probabilities = torch.softmax(outputs, dim=1)
+                            confidence, predicted_class = torch.max(probabilities, 1)
+                            action_id = predicted_class.item()
+                            conf_score = confidence.item()
+                        
+                        if action_id == 1 and conf_score > 0.85:
+                            self.false_frame_counter = 0  # On réinitialise, tout va bien
+                            self.throw_detected = True    # Le lancer est actif
 
-                if len(self.frame_history_momentum) > 0:
-                    last_f = self.frame_history_momentum[-1]
-                    # La vitesse absolue est la valeur absolue de la différence de position d'une frame à l'autre
-                    vitesse_inst_obj = abs(current_obj_z - last_f['obj_z'])
-                    vitesse_inst_holding = abs(holding_dist - last_f['holding_dist'])
+                            cv2.putText(annotated_image, f"THROW ({conf_score*100:.0f}%)", (30, 50),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
 
-                self.frame_history_momentum.append({
-                    'obj_z': current_obj_z,
-                    'holding_dist' : holding_dist,
-                    'non_holding_dist': non_holding_dist,
-                    'v_obj': vitesse_inst_obj,
-                    'v_holding': vitesse_inst_holding
-                })
-                self.frame_history_throw.append({
-                    'obj_z': current_obj_z,
-                    'holding_dist' : holding_dist,
-                    'non_holding_dist': non_holding_dist
-                })
-
-                if len(self.frame_history_momentum) > self.max_momentum_history:
-                    self.frame_history_momentum.pop(0)
-
-                if len(self.frame_history_throw) > self.max_throw_history:
-                    self.frame_history_throw.pop(0)
-
-                ###############################
-                #           CONDITIONS        #
-                #              ÉLAN           #
-                ###############################
-
-                if len(self.frame_history_momentum) == self.max_momentum_history:
-                    old_frame = self.frame_history_momentum[0]   # La frame d'il y a 20 frames (T-10)
-                    current_frame = self.frame_history_momentum[-1]
-
-                    delta_obj_camera_z = current_frame['obj_z'] - old_frame['obj_z']
-                    delta_holding = current_frame['holding_dist'] - old_frame['holding_dist']
-                    delta_non_holding = current_frame['non_holding_dist'] - old_frame['non_holding_dist']
-
-                    v_obj_debut = sum(f['v_obj'] for f in self.frame_history_momentum[1:6]) / 5.0
-                    v_obj_fin = sum(f['v_obj'] for f in self.frame_history_momentum[-5:]) / 5.0
-
-                    v_holding_debut = sum(f['v_holding'] for f in self.frame_history_momentum[1:6]) / 5.0
-                    v_holding_fin = sum(f['v_holding'] for f in self.frame_history_momentum[-5:]) / 5.0
-
-                    # Condition : Les vitesses de fin doivent être strictement supérieures aux vitesses de début
-                    vitesses_en_augmentation = (v_obj_fin > v_obj_debut) and (v_holding_fin > v_holding_debut)
-
-                    if delta_obj_camera_z >= 0.10 and delta_non_holding >= 0.05 and vitesses_en_augmentation:
-                        if not self.momentum_detected:
-                            self.momentum_detected = True
-                            self.last_momentum_time = time.time()
-                            self.get_logger().info("Momentum detected !")
-                            cv2.putText(annotated_image, "Momentum detected !", (30, 120),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
+                            if object_center_meters is not None:
+                                ox, oy, oz = object_center_meters
+                                coord_text = f"Obj: X:{ox:.3f}m, Y:{oy:.3f}m, Z:{oz:.3f}m"                                
+                                cv2.putText(annotated_image, coord_text, (30, h_color - 50),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 1, self.box_color, 2)
+                        else:
+                            # 🟢 ANTI-REBOND : L'IA ne voit plus de lancer, mais on attend avant de paniquer
+                            self.false_frame_counter += 1
                             
-                    else:
-                        if abs(delta_obj_camera_z) < 0.05:
-                            self.momentum_detected = False
+                            # Seulement si on dépasse le seuil (ex: 10 frames), on officialise l'arrêt
+                            if self.false_frame_counter >= self.max_false_frames_allowed:
+                                self.throw_detected = False
 
-                ###############################
-                #           CONDITIONS        #
-                #             LANCER          #
-                ###############################
-
-                if len(self.frame_history_throw) == self.max_throw_history:
-                    old_frame = self.frame_history_throw[0]
-                    current_frame = self.frame_history_throw[-1]
-
-                    delta_obj_camera_z = current_frame['obj_z'] - old_frame['obj_z']
-                    delta_non_holding = current_frame['non_holding_dist'] - old_frame['non_holding_dist']
-
-                    if len(self.frame_history_throw) >= 4:
-                        vitesse_debut_poignet = self.frame_history_throw[3]['holding_dist'] - self.frame_history_throw[0]['holding_dist']
-                        vitesse_fin_poignet = self.frame_history_throw[-1]['holding_dist'] - self.frame_history_throw[-4]['holding_dist']
-                        poignet_decelere = vitesse_fin_poignet < (vitesse_debut_poignet * 0.5) or abs(vitesse_fin_poignet) < 0.02
-                    else:
-                        poignet_decelere = False
-
-                    time_since_momentum = time.time() - self.last_momentum_time
-
-                    if delta_obj_camera_z <= -0.20 and abs(delta_non_holding) >= 0.05 and time_since_momentum <= 3.0 and poignet_decelere:
-                        if not self.throw_detected:
-                            self.throw_detected = True
-                            self.get_logger().info("Throw detected !")
-                            cv2.putText(annotated_image, "Throw detected !", (30, 120),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 225, 0), 3)
+                        # 🆕 ÉTAPE B : Gestion des flancs avec sécurité Cooldown
+                        if self.throw_detected is True and self.previous_throw_detected is not True:
                             
-                    else:
-                        if abs(delta_obj_camera_z) < 0.05:
-                            self.throw_detected = False
+                            # ⏱️ Calcul du temps écoulé depuis le TOUT PREMIER déclenchement du lancer précédent
+                            time_since_last_throw = current_timestamp - self.last_throw_trigger_time
+                            
+                            if time_since_last_throw >= self.cooldown_duration:
+                                # C'est un VRAI nouveau lancer (le cooldown est expiré)
+                                self.last_throw_trigger_time = current_timestamp  # On verrouille le chrono
+                                
+                                self.get_logger().info(f"Throw started ({conf_score*100:.0f}%) : trajectory prediction start !")
+
+                                if object_center_meters is not None:
+                                    self.throw_coordinates = object_center_meters
+                                    rx, ry, rz = self.throw_coordinates
+                                    self.get_logger().info(f"Initial throw point (frame {self.frame_count}) ---> X: {rx:.3f}m, Y: {ry:.3f}m, Z: {rz:.3f}m")
+                                    
+                                    if self.previous_object_center_meters is not None and self.previous_object_timestamp is not None:
+                                        dt = current_timestamp - self.previous_object_timestamp
+                                        if dt > 0:
+                                            vrx = (rx - self.previous_object_center_meters[0]) / dt
+                                            vry = (ry - self.previous_object_center_meters[1]) / dt
+                                            vrz = (rz - self.previous_object_center_meters[2]) / dt
+                                            self.get_logger().info(f"Initial Velocity ---> vrx: {vrx:.3f} m/s, vry: {vry:.3f} m/s, vrz: {vrz:.3f} m/s")
+                                        else:
+                                            self.get_logger().warn("Failed to calculate th einitial velocity : dt is equal to zero or is negative.")
+                                    else:
+                                        self.get_logger().warn("Failed to calculate the initial velocity : no data from the previous frame.")
+                                else:
+                                    self.throw_coordinates = None
+                                    self.get_logger().warn("Throw detected but the object is invisible.")
+                            else:
+                                # ❌ Blocage : C'est un faux départ dû à un rebond trop rapide
+                                self.get_logger().info(f"Flickering detected ! New initial point blocked by cooldown ({self.cooldown_duration - time_since_last_throw:.1f}s left)")
+                                # On force l'état à False pour réinitialiser l'automate au prochain cycle
+                                self.throw_detected = False
+
+                        elif self.throw_detected is not True and self.previous_throw_detected is True:
+                            # 🔴 Le lancer est officiellement clos (après confirmation des 10 frames vides)
+                            self.get_logger().info("Throw ended.")
+                            self.throw_coordinates = None
+
+                        self.previous_throw_detected = self.throw_detected
+
+                    self.previous_object_center_meters = object_center_meters
+                    self.previous_object_timestamp = current_timestamp
 
             self.frame_count += 1
 
-            cv2.putText(annotated_image, f"Frame {self.frame_count}", (1100, 50),
+            cv2.putText(annotated_image, f"Frame {self.frame_count}", (1150, 50),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     
             if self.save_distance_mode:        
@@ -437,8 +496,7 @@ class MathematicalThrowDetectionNode(Node):
                     writer.writerow([self.frame_count, round(current_timestamp, 4), object_z_csv, left_dist_csv, right_dist_csv, ""])
 
             if self.record_mode:
-                if self.video_writer is None:  
-                    h_color, w_color = annotated_image.shape[:2]
+                if self.video_writer is None:
                     self.record_path = os.path.join(self.video_folder,                   
                                 f"capture_{self.timestamp_csv}.avi")                                     
                     fourcc = cv2.VideoWriter_fourcc(*'MJPG')                    
@@ -448,8 +506,7 @@ class MathematicalThrowDetectionNode(Node):
                 if self.video_writer is not None:
                     self.video_writer.write(annotated_image)
 
-            cv2.putText(annotated_image, "Press ECHAP to quit", (30, 50),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            #cv2.putText(annotated_image, "Press ECHAP to quit", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             cv2.imshow("Combined YOLO Detections & Poses", annotated_image)
             key = cv2.waitKey(1) & 0xFF
 
@@ -473,7 +530,7 @@ class MathematicalThrowDetectionNode(Node):
 def main(args=None):
     
     rclpy.init(args=args)
-    node = MathematicalThrowDetectionNode()
+    node = LSTMNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

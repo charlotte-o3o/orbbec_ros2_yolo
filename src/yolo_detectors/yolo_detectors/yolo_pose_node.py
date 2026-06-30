@@ -165,24 +165,6 @@ class YoloPoseNode(Node):
 
                     distance_box_m = cv_depth_image[y_mean_shoulder, x_mean_shoulder] / 1000.0
 
-                    human_pose_msg = HumanPose()
-                    human_pose_msg.id = int(i) # ID de la personne détectée
-
-                    # Remplissage du centre 3D de l'humain (X et Y en pixel, Z en mètres)
-                    human_pose_msg.position_centre_3d.x = float(cx)
-                    human_pose_msg.position_centre_3d.y = float(cy)
-                    human_pose_msg.position_centre_3d.z = float(distance_box_m)
-
-                    # Remplissage de TOUS les 17 keypoints de la personne dans la liste
-                    for kp in person_kpts:
-                        kp_msg = Keypoint2D()
-                        kp_msg.x = float(kp[0])
-                        kp_msg.y = float(kp[1])
-                        kp_msg.confidence = float(kp[2]) # Score d'invisibilité/visibilité du point
-                        human_pose_msg.keypoints.append(kp_msg)
-
-                    msg_pose_array.poses.append(human_pose_msg)
-
                     if distance_box_m > 0:
                         x_meters = ((x_mean_shoulder - self.cx) * distance_box_m) / self.fx
                         y_meters = ((y_mean_shoulder - self.cy) * distance_box_m) / self.fy

@@ -98,7 +98,7 @@ If the topics stop being published, stop the Docker container, unplug the camera
 
 | Parameter | Default | Description |
 |---|---|---|
-| `model_path` | `weights/throw_lstm_v7.pth` | Path to the trained `ThrowLSTM` weights (hardcoded to `~/ros2_orbbec_ws/weights/throw_lstm_v7.pth`) |
+| `model_path` | `weights/throw_lstm_v8.pth` | Path to the trained `ThrowLSTM` weights (hardcoded to `~/ros2_orbbec_ws/weights/throw_lstm_v8.pth`) |
 | `sequence_length` | `20` | Number of consecutive frames (object/wrist distances + deltas) used as input to the LSTM |
 | `input_size` | `6` | Number of input features per frame (object distance, left/right wrist distances, and their frame-to-frame deltas) |
 | `num_classes` | `2` | Number of output classes (throw / no throw) |
@@ -132,7 +132,7 @@ ros2_orbbec_ws/
 ├── weights/                      # Model weights
 │   ├── yolo26n-pose.pt
 │   ├── alien_plushie_v4.pt
-│   └── throw_lstm_v7.pth
+│   └── throw_lstm_v8.pth
 ├── requirements.txt
 ├── setup_env.sh
 └── cyclonedds_host.xml

@@ -12,6 +12,9 @@ import message_filters
 from vision_msgs.msg import Detection2DArray
 from cv_bridge import CvBridge
 from sensor_msgs.msg import CameraInfo, Image
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import cv2
 import random
 import csv
@@ -117,6 +120,12 @@ class LSTMNode(Node):
         self.false_frame_counter = 0      
         self.max_false_frames_allowed = 10
 
+        self.trajectory_tracking_active = False
+        self.predicted_trajectory = None
+        self.trajectory_start_time = None
+        self.trajectory_tracking_duration = 3.0
+        self.trajectory_history = []
+
         # Détecter si on a une carte graphique NVIDIA, sinon utiliser le processeur
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
@@ -124,7 +133,7 @@ class LSTMNode(Node):
         self.model = ThrowLSTM(input_size=6, num_classes=2).to(self.device)
         
         # Définis ici le chemin exact vers ton fichier throw_lstm.pth
-        model_path = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "weights", "throw_lstm_v8.pth")
+        model_path = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "weights", "throw_lstm_v6.pth")
         
         try:
             # Chargement des poids
@@ -175,7 +184,6 @@ class LSTMNode(Node):
 
         self.sync.registerCallback(self.synchronized_callback)
 
-
     def camera_info_callback(self, msg: CameraInfo):
 
         if not self.has_camera_info:
@@ -188,6 +196,64 @@ class LSTMNode(Node):
             self.get_logger().info(f"Camera info received: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
 
             self.destroy_subscription(self.sub_info)  # Unsubscribe after receiving camera info
+
+    def predict_parabolic_trajectory(self, x0, y0, z0, vx0, vy0, vz0,
+                                  g=9.81, dt=None, z_camera=0.3):
+        """
+        Calcule les points de la trajectoire parabolique de l'objet
+        à partir de sa position et vitesse initiales (repère caméra, en mètres).
+
+        Retourne une liste de tuples (t, x, y, z) jusqu'à ce que
+        l'objet atteigne la caméra.
+        """
+        trajectory = []
+        t = 0.0
+        max_time = 5.0 
+        if dt is None:
+            dt = 1.0 / self.fps_camera
+
+        while t <= max_time:
+            x = vx0 * t + x0
+            y = 0.5 * g * (t ** 2) + vy0 * t + y0
+            z = vz0 * t + z0
+
+            trajectory.append((t, x, y, z))
+
+            if z <= z_camera and t > 0:
+                break
+
+            t += dt
+
+        return trajectory
+    
+    def plot_trajectory_history(self):
+        if not self.trajectory_history:
+            self.get_logger().warn("No trajectory history to plot.")
+            return
+
+        plt.figure(figsize=(8, 6))
+
+        for i, traj in enumerate(self.trajectory_history):
+            # traj est une liste de tuples (t, x, y, z)
+            xs = [point[1] for point in traj]
+            ys = [-point[2] for point in traj]
+            zs = [-point[3] for point in traj]
+            plt.plot(zs, ys, alpha=0.5, label=f"Prediction {i+1}" if i % 5 == 0 else None)
+
+        plt.xlabel("Z (m)")
+        plt.ylabel("Y (m)")
+        plt.title("Predicted trajectories")
+        plt.grid(True)
+
+        plot_dir = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "lstm","trajectory_plots")
+        if not os.path.exists(plot_dir):
+            os.makedirs(plot_dir)
+        plot_path = os.path.join(plot_dir, f"trajectories_{time.strftime('%Y-%m-%d_%H-%M-%S')}.png")
+        plt.savefig(plot_path)
+        plt.close()
+
+        self.get_logger().info(f"Trajectory plot saved : {plot_path}")
+
 
     def synchronized_callback(self, color_msg, depth_msg, yolo_objects, yolo_poses):
         # Process the synchronized messages here
@@ -424,12 +490,7 @@ class LSTMNode(Node):
 
                             cv2.putText(annotated_image, f"THROW ({conf_score*100:.0f}%)", (30, 50),
                                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-
-                            if object_center_meters is not None:
-                                ox, oy, oz = object_center_meters
-                                coord_text = f"Obj: X:{ox:.3f}m, Y:{oy:.3f}m, Z:{oz:.3f}m"                                
-                                cv2.putText(annotated_image, coord_text, (30, h_color - 50),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 1, self.box_color, 2)
+                            
                         else:
                             # 🟢 ANTI-REBOND : L'IA ne voit plus de lancer, mais on attend avant de paniquer
                             self.false_frame_counter += 1
@@ -453,35 +514,76 @@ class LSTMNode(Node):
                                 if object_center_meters is not None:
                                     self.throw_coordinates = object_center_meters
                                     rx, ry, rz = self.throw_coordinates
-                                    self.get_logger().info(f"Initial throw point (frame {self.frame_count}) ---> X: {rx:.3f}m, Y: {ry:.3f}m, Z: {rz:.3f}m")
+
+                                    coord_text = f"Obj: X:{rx:.3f}m, Y:{ry:.3f}m, Z:{rz:.3f}m"
+                                    cv2.putText(annotated_image, coord_text, (30, h_color - 50),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 1, self.box_color, 2)
                                     
-                                    if self.previous_object_center_meters is not None and self.previous_object_timestamp is not None:
-                                        dt = current_timestamp - self.previous_object_timestamp
-                                        if dt > 0:
-                                            vrx = (rx - self.previous_object_center_meters[0]) / dt
-                                            vry = (ry - self.previous_object_center_meters[1]) / dt
-                                            vrz = (rz - self.previous_object_center_meters[2]) / dt
-                                            self.get_logger().info(f"Initial Velocity ---> vrx: {vrx:.3f} m/s, vry: {vry:.3f} m/s, vrz: {vrz:.3f} m/s")
-                                        else:
-                                            self.get_logger().warn("Failed to calculate th einitial velocity : dt is equal to zero or is negative.")
-                                    else:
-                                        self.get_logger().warn("Failed to calculate the initial velocity : no data from the previous frame.")
+                                    self.get_logger().info(f"Initial throw point (frame {self.frame_count}) ---> X: {rx:.3f}m, Y: {ry:.3f}m, Z: {rz:.3f}m")
+
+                                    self.trajectory_tracking_active = True
+                                    self.trajectory_start_time = current_timestamp                                
+                                    self.trajectory_history = []  
+
                                 else:
                                     self.throw_coordinates = None
                                     self.get_logger().warn("Throw detected but the object is invisible.")
+                                    
                             else:
-                                # ❌ Blocage : C'est un faux départ dû à un rebond trop rapide
                                 self.get_logger().info(f"Flickering detected ! New initial point blocked by cooldown ({self.cooldown_duration - time_since_last_throw:.1f}s left)")
-                                # On force l'état à False pour réinitialiser l'automate au prochain cycle
                                 self.throw_detected = False
 
                         elif self.throw_detected is not True and self.previous_throw_detected is True:
-                            # 🔴 Le lancer est officiellement clos (après confirmation des 10 frames vides)
                             self.get_logger().info("Throw ended.")
                             self.throw_coordinates = None
 
                         self.previous_throw_detected = self.throw_detected
 
+                        if self.trajectory_tracking_active:
+                            if (object_center_meters is not None
+                                    and self.previous_object_center_meters is not None
+                                    and self.previous_object_timestamp is not None):
+
+                                rx, ry, rz = object_center_meters
+                                dt = current_timestamp - self.previous_object_timestamp
+
+                                if dt > 0:
+                                    vrx = (rx - self.previous_object_center_meters[0]) / dt
+                                    vry = (ry - self.previous_object_center_meters[1]) / dt
+                                    vrz = (rz - self.previous_object_center_meters[2]) / dt
+
+                                    self.predicted_trajectory = self.predict_parabolic_trajectory(
+                                        x0=rx, y0=ry, z0=rz,
+                                        vx0=vrx, vy0=vry, vz0=vrz,
+                                        dt=dt
+                                    )
+
+                                    self.trajectory_history.append(self.predicted_trajectory) 
+
+                                    self.get_logger().info(
+                                        f"Trajectory updated (frame {self.frame_count}) ---> "
+                                        f"pos: X:{rx:.3f}m Y:{ry:.3f}m Z:{rz:.3f}m | "
+                                        f"vel: vx:{vrx:.3f} vy:{vry:.3f} vz:{vrz:.3f} m/s | "
+                                        f"{len(self.predicted_trajectory)} points predicted"
+                                    )
+
+                                    if ry < 0.1:
+                                        self.trajectory_tracking_active = False
+                                        self.get_logger().info(f"Object landed (Y={ry:.3f}m < 0.1m). Trajectory tracking stopped.")                                           
+                                        self.plot_trajectory_history()     
+
+                                else:
+                                    self.get_logger().warn("Cannot update trajectory: dt is zero or negative.")
+
+                            else:
+                                self.get_logger().warn("Cannot update trajectory: missing current or previous object position.")
+
+                            elapsed = current_timestamp - self.trajectory_start_time
+                            if elapsed >= self.trajectory_tracking_duration:
+                                self.trajectory_tracking_active = False
+                                self.get_logger().info(f"Trajectory tracking stopped after {elapsed:.2f}s.")
+                                self.plot_trajectory_history()
+   
                     self.previous_object_center_meters = object_center_meters
                     self.previous_object_timestamp = current_timestamp
 

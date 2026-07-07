@@ -26,7 +26,8 @@ setup(
             'inference_stgcn = yolo_detectors.inference_stgcn_node:main',
             'double_detection = yolo_detectors.double_detection_node:main',
             'mathematical_throw_detection = yolo_detectors.mathematical_throw_detection_node:main',
-            'lstm = yolo_detectors.lstm_node:main'
+            'lstm = yolo_detectors.lstm_node:main',
+            'speed_det = yolo_detectors.speed_det_node:main'
         ],
     },
 )

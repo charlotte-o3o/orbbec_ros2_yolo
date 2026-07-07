@@ -59,10 +59,6 @@ class SpeedDetNode(Node):
             self.csv_path = os.path.join(self.distance_log_dir,                   
                                     f"distances_{self.timestamp_csv}.csv")         
 
-            # On garde le fichier ouvert en continu au lieu de faire un
-            # open()/close() a chaque frame (~30 fois/seconde) : ca evite
-            # un aller-retour disque inutile sur le chemin le plus chaud
-            # du node. Il sera ferme proprement dans destroy_node().
             self.csv_file = open(self.csv_path, mode='w', newline='')
             self.csv_writer = csv.writer(self.csv_file)
             self.csv_writer.writerow(['frame', 'timestamp', 'X(m)', 'Y(m)', 'Z(m)', 'object_speed_m_s', 'label'])
@@ -134,8 +130,6 @@ class SpeedDetNode(Node):
         # A adapter a ta piece/setup si besoin.
         self.max_predicted_height = 3.0   # m, Y ne doit jamais monter en dessous de ca (2m au-dessus de l'origine camera)
         self.max_predicted_fall = -2.0      # m, Y ne doit jamais depasser ca vers le bas (sol/limite basse plausible)
-
-        
 
         self.camera_tilt_deg = 0.0  # Ajuste l'angle réel de ton trépied ici
         self.theta = np.radians(self.camera_tilt_deg)
@@ -226,9 +220,11 @@ class SpeedDetNode(Node):
             - raw_trajectory (list ou None) : points futurs prédits [(t, x, y, z), ...]
             - vx_moy (float) : vitesse moyenne estimée sur X
             - vz_moy (float) : vitesse moyenne estimée sur Z
-        """
+            - y_at_landing (float ou None) : Hauteur Y estimée au plan Z = 0.1m
+            - time_to_landing (float ou None) : Temps restant (en s) avant d'atteindre la caméra
+            """
         if len(self.trajectory_observed) < 3:
-            return None, 0.0, 0.0
+            return None, 0.0, 0.0, 0.0, 0.0
 
         ts = np.array([p[0] for p in self.trajectory_observed])
         xs = np.array([p[1] for p in self.trajectory_observed])
@@ -244,11 +240,26 @@ class SpeedDetNode(Node):
 
         # Si le vecteur Z global pointe dans le mauvais sens, prédiction invalide
         if vz_moy >= -0.05:
-            return None, vx_moy, vz_moy
+            return None, vx_moy, vz_moy, 0.0, 0.0
 
         # Ajustement gravitationnel de Y (repère Y positif vers le haut)
         ys_adjusted = ys + 0.5 * g_const * (ts ** 2)
         poly_y = np.polyfit(ts, ys_adjusted, 1)
+
+        # ==========================================
+        #    CALCUL ANALYTIQUE DE L'ATTERRISSAGE (REPÈRE WORLD)
+        # ==========================================
+        # Z_world(t) = poly_z[0] * t + poly_z[1]
+        # On cherche t_landing tel que Z_world(t_landing) = 0.0
+        target_z_world = 0.0
+        t_landing = (target_z_world - poly_z[1]) / vz_moy
+        
+        # Le temps restant avant de franchir la ligne Z_world = 0
+        time_to_landing = t_landing - t_since_start
+        
+        # Calcul de la hauteur Y_world exacte à cet instant précis
+        y_at_landing = -0.5 * g_const * (t_landing ** 2) + poly_y[0] * t_landing + poly_y[1]
+        # ==========================================
 
         raw_trajectory = []
         t_future = t_since_start
@@ -278,14 +289,14 @@ class SpeedDetNode(Node):
             last_y = last_point[2]
             last_z = last_point[3]
 
-            if last_y <= self.max_predicted_fall and last_z > 1.5:
+            if last_y <= self.max_predicted_fall and last_z > (self.landing_z_threshold + 0.30):
                 self.get_logger().warn(
                     f"Trajectory prediction rejected (cliff effect): object hit the floor at Z={last_z:.2f}m "
                     f"instead of reaching the camera | estimated vz: {vz_moy:.3f} m/s"
                 )
-                return None, vx_moy, vz_moy
+                return None, vx_moy, vz_moy, 0.0, 0.0
 
-        return raw_trajectory, vx_moy, vz_moy
+        return raw_trajectory, vx_moy, vz_moy, y_at_landing, time_to_landing
 
     def plot_trajectory_history(self):
         if not self.trajectory_observed and not self.trajectory_history:
@@ -359,7 +370,6 @@ class SpeedDetNode(Node):
         self.last_history_sample_time = None
 
     def synchronized_callback(self, color_msg, depth_msg, yolo_objects, yolo_poses):
-        # Process the synchronized messages here
         try: 
             annotated_image = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
             cv_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
@@ -376,14 +386,12 @@ class SpeedDetNode(Node):
             rx, ry, rz = None, None, None
 
             for detection in yolo_objects.detections:
-                # Récupération des dimensions
                 x_center = detection.bbox.center.position.x
                 y_center = detection.bbox.center.position.y
                 size_x = detection.bbox.size_x
                 size_y = detection.bbox.size_y
                 object_center_pixels = (int(x_center), int(y_center))
 
-                # Calcul des coins supérieur gauche et inférieur droit
                 x1 = int(x_center - size_x / 2)
                 y1 = int(y_center - size_y / 2)
                 x2 = int(x_center + size_x / 2)
@@ -394,10 +402,8 @@ class SpeedDetNode(Node):
                     cv2.circle(annotated_image, (int(x_center), int(y_center)), 8, self.box_color, -1)
 
                 if len(detection.results) > 0:
-                    # On récupère le premier résultat (l'hypothèse principale de YOLO)
                     result = detection.results[0]
                     
-                    # Lecture des coordonnées 3D en mètres calculées par fine_tune_yolo_node
                     if result.pose.pose.position.z >= 0.1:
                         object_center_meters = (result.pose.pose.position.x, 
                                                 result.pose.pose.position.y, 
@@ -416,8 +422,6 @@ class SpeedDetNode(Node):
                 
             for pose in yolo_poses.poses:
                 kpts = pose.keypoints
-
-                # Vérification de la validité de l'index 9 (Poignet droit)
                 if len(kpts) > 9 and kpts[9].confidence > 0.7 and cv_depth_image is not None:
                     lw_x = int(kpts[9].x)
                     lw_y = int(kpts[9].y)
@@ -430,7 +434,6 @@ class SpeedDetNode(Node):
                         cv2.putText(annotated_image, "LEFT WRIST", (lw_x + 10, lw_y + 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, self.left_wrist_color, 3)
 
-                # Vérification de la validité de l'index 10 (Poignet gauche)
                 if len(kpts) > 10 and kpts[10].confidence > 0.7 and cv_depth_image is not None:
                     rw_x = int(kpts[10].x)
                     rw_y = int(kpts[10].y)
@@ -495,17 +498,12 @@ class SpeedDetNode(Node):
                     else:
                         self.get_logger().warn("Cannot compute speed: dt too small or negative.")
                                         
-                # Sauvegarde pour la frame suivante
                 self.last_world_pos = list(current_world_pos)
                 self.last_timestamp = current_timestamp
                 object_speed_csv = round(object_speed_m_s, 4) 
 
-                if self.annotations_mode:
-                    remaining = self.startup_grace_period - current_timestamp
-                    cv2.putText(annotated_image, f"WARMING UP ({remaining:.1f}s)", (30, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)    
-
-                if current_timestamp >= self.startup_grace_period and object_speed_m_s >= self.speed_threshold and vrz < 0:
+                remaining_time = self.startup_grace_period - current_timestamp
+                if remaining_time <= 0 and object_speed_m_s >= self.speed_threshold and vrz < 0:
                     self.throw_confirm_counter += 1
 
                     if self.throw_confirm_counter >= self.throw_confirm_frames:
@@ -516,7 +514,13 @@ class SpeedDetNode(Node):
                                     cv2.putText(annotated_image, f"THROW", (30, 50),                                        
                                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
 
-                else:
+                elif remaining_time > 0:
+                    if self.annotations_mode:
+                        remaining = self.startup_grace_period - current_timestamp
+                        cv2.putText(annotated_image, f"WARMING UP ({remaining:.1f}s)", (30, 50),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 165, 255), 3)
+                        
+                else:   # if remaining_time <= 0 but not (object_speed_m_s >= self.speed_threshold and vrz < 0):
                     self.throw_confirm_counter = 0
                     self.false_frame_counter += 1                    
                     if self.false_frame_counter >= self.max_false_frames_allowed:
@@ -526,7 +530,6 @@ class SpeedDetNode(Node):
                     time_since_last_throw = current_timestamp - self.last_throw_trigger_time
 
                     if time_since_last_throw >= self.cooldown_duration:
-                        # C'est un VRAI nouveau lancer (le cooldown est expiré)
                         self.last_throw_trigger_time = current_timestamp 
 
                         if self.is_valid_object_position(object_center_meters):
@@ -536,12 +539,10 @@ class SpeedDetNode(Node):
                                 coord_text = f"Obj: X:{rx_world:.3f}m, Y:{ry_world:.3f}m, Z:{rz_world:.3f}m"
                                 cv2.putText(annotated_image, coord_text, (30, h_color - 50),                                            
                                         cv2.FONT_HERSHEY_SIMPLEX, 1, self.box_color, 2)
-                                
-                            #self.get_logger().info(f"Initial throw point (frame {self.frame_count}) ---> X: {rx_world:.3f}m, Y: {ry_world:.3f}m, Z: {rz_world:.3f}m")
 
                             self.trajectory_tracking_active = True
                             self.trajectory_start_time = current_timestamp
-                            self.trajectory_start_frame = self.frame_count # pour retrouver ce lancer dans la video/CSV
+                            self.trajectory_start_frame = self.frame_count 
                             self.trajectory_observed = [(0.0,) + tuple(self.throw_coordinates)] # pour inclure le premier point observé dans la trajectoire
                             #self.trajectory_observed = []  # on ancre sur le 2eme point du lancer car le premier point utilise les données brutes potentiellement bruitées
                             self.trajectory_history = []
@@ -585,104 +586,52 @@ class SpeedDetNode(Node):
 
                     elif object_speed_m_s >= self.speed_threshold and vrz < -0.05:
                         t_since_start = current_timestamp - self.trajectory_start_time
-                        self.trajectory_observed.append((
-                            t_since_start, 
-                            rx_world, 
-                            ry_world, 
-                            rz_world
-                        ))
+
+                        if self.trajectory_observed:
+                            last_recorded_t = self.trajectory_observed[-1][0]
+                            time_gap = t_since_start - last_recorded_t
+                            if time_gap > 0.50:  # Plus de 500ms de silence (environ 15 frames perdues)
+                                stop_reason = f"Trajectory tracking aborted: black hole detected ({time_gap:.2f}s without valid updates)."
+                                self.trajectory_tracking_active = False
+
+                        if stop_reason is None:
+                            self.trajectory_observed.append((
+                                t_since_start, 
+                                rx_world, 
+                                ry_world, 
+                                rz_world
+                            ))
 
                         if len(self.trajectory_observed) >= 3 and len(self.trajectory_observed) % 2 == 0:
                             dt_frame = dt if dt is not None else (1.0 / self.fps_camera)
-                            raw_trajectory, vx_moy, vz_moy = self.predict_smoothed_trajectory(t_since_start, dt_frame)
+                            raw_trajectory, vx_moy, vz_moy, y_at_landing, time_to_landing = self.predict_smoothed_trajectory(t_since_start, dt_frame)
 
-                            ts = np.array([p[0] for p in self.trajectory_observed])
-                            xs = np.array([p[1] for p in self.trajectory_observed])
-                            ys = np.array([p[2] for p in self.trajectory_observed])
-                            zs = np.array([p[3] for p in self.trajectory_observed])
-
-                            # Régression linéaire (degré 1) pour X et Z (vitesse constante uniforme)
-                            poly_x = np.polyfit(ts, xs, 1) 
-                            poly_z = np.polyfit(ts, zs, 1)
-
-                            if poly_z[0] >= -0.05:
-                                self.get_logger().warn(
-                                    f"Trajectory prediction rejected (global Vz positive or flat): "
-                                    f"Vx moy: {poly_x[0]:.2f}m/s | Vz moy: {poly_z[0]:.2f}m/s. Anomalous point removed."
-                                )
-                                self.predicted_trajectory = None
-                                self.trajectory_observed.pop()
-
-                            else: 
-                                g_const = 9.81
-                                ys_adjusted = ys + 0.5 * g_const * (ts ** 2)
-                                poly_y = np.polyfit(ts, ys_adjusted, 1)
-
-                                raw_trajectory = []
-                                t_future = t_since_start
-                                max_time = t_since_start + 2.0  # Prédire jusqu'à 2 secondes dans le futur
-                                dt_frame = dt if dt is not None else (1.0 / self.fps_camera)
-
-                                while t_future <= max_time:
-                                    # Évaluation des modèles lissés par moindres carrés
-                                    x_pred = poly_x[0] * t_future + poly_x[1]
-                                    y_pred = -0.5 * g_const * (t_future ** 2) + poly_y[0] * t_future + poly_y[1]
-                                    z_pred = poly_z[0] * t_future + poly_z[1]
-
-                                    # Garde-fous physiques d'origine du code
-                                    if y_pred > self.max_predicted_height or y_pred < self.max_predicted_fall:
-                                        raw_trajectory.append((t_future, x_pred, y_pred, z_pred))
-                                        break
-
-                                    raw_trajectory.append((t_future, x_pred, y_pred, z_pred))
-
-                                    if z_pred <= self.landing_z_threshold and t_future > 0:
-                                        break
-
-                                    t_future += dt_frame
-
-                                is_trajectory_valid = True
-                                if raw_trajectory and len(raw_trajectory) > 0:
-                                    last_point = raw_trajectory[-1]
-                                    #last_t = last_point[0]
-                                    last_y = last_point[2]
-                                    last_z = last_point[3]
-
-                                    # Si la trajectoire a coupé prématurément au sol (Y >= max_fall)
-                                    # mais que l'objet est resté bloqué au loin (Z > 1.5m), c'est un cliff effect.
-                                    if last_y <= self.max_predicted_fall and last_z > 1.5:
-                                        is_trajectory_valid = False
-                                        self.get_logger().warn(
-                                            f"Trajectory prediction rejected (cliff effect): object hit the floor at Z={last_z:.2f}m "
-                                            f"instead of reaching the camera | estimated vz: {poly_z[0]:.3f} m/s"
-                                        )
-
-                                    """gravity_drop = 0.5 * g_const * (last_t ** 2)
-
-                                    if gravity_drop > 8.0 or last_t > 4.0:
-                                        is_trajectory_valid = False
-                                        self.get_logger().warn(
-                                            f"Trajectory prediction rejected (cliff effect) : fall of {gravity_drop:.2f}m in {last_t:.2f}s | estimated vz: {poly_z[0]:.3f} m/s"
-                                        )"""
-
-                                if raw_trajectory and len(raw_trajectory) > 0 and is_trajectory_valid:
-                                    self.predicted_trajectory = raw_trajectory
-
-                                    # Archivage pour l'historique d'évolution du graphique de fin
-                                    if (self.last_history_sample_time is None
-                                            or (current_timestamp - self.last_history_sample_time) >= self.history_sampling_interval):
-                                        self.trajectory_history.append(self.predicted_trajectory)
-                                        self.last_history_sample_time = current_timestamp
-
-                                    self.get_logger().info(
-                                        f"Trajectory updated ({len(self.trajectory_observed)} obs. pts) ---> "
-                                        f"Vx moy: {poly_x[0]:.2f}m/s | Vz moy: {poly_z[0]:.2f}m/s"
+                            if raw_trajectory is None:
+                                if vz_moy >= -0.05:
+                                    self.get_logger().warn(
+                                        f"Trajectory prediction rejected (global Vz positive or flat): "
+                                        f"Vx moy: {vx_moy:.2f}m/s | Vz moy: {vz_moy:.2f}m/s. Anomalous point removed."
                                     )
+                                    self.trajectory_observed.pop()
+                                self.predicted_trajectory = None
+                            else:
+                                self.predicted_trajectory = raw_trajectory
 
-                                else:
-                                    self.predicted_trajectory = None
+                                if (self.last_history_sample_time is None
+                                        or (current_timestamp - self.last_history_sample_time) >= self.history_sampling_interval):
+                                    self.trajectory_history.append(self.predicted_trajectory)
+                                    self.last_history_sample_time = current_timestamp
+
+                                self.get_logger().info(
+                                    f"Trajectory updated ({len(self.trajectory_observed)} obs. pts) ---> "
+                                    f"Vx moy: {vx_moy:.2f}m/s | Vz moy: {vz_moy:.2f}m/s"
+                                )
+                                self.get_logger().info(
+                                    f"[PRED] Y_landing: {y_at_landing:.2f}m | Impact in: {time_to_landing:.3f}s"
+                                )   
 
                         time_tracked = current_timestamp - self.trajectory_start_time
+
                         if rz < self.landing_z_threshold and time_tracked >= self.min_time_before_landing_check:
                             self.landing_confirm_counter += 1
                         else:
@@ -690,12 +639,9 @@ class SpeedDetNode(Node):
 
                         if self.landing_confirm_counter >= self.landing_confirm_frames:
                             stop_reason = f"Object has reached the camera (Z={rz:.3f}m < {self.landing_z_threshold}m, confirmed)."
-            
+                    
                     else:
                         self.get_logger().warn("Cannot update trajectory : vz too small")
-
-                else:
-                    pass
 
                 if stop_reason is None and self.false_frame_counter >= self.max_false_frames_allowed:
                     stop_reason = "Trajectory tracking aborted: object stopped moving or lost."
@@ -713,8 +659,7 @@ class SpeedDetNode(Node):
             if self.is_valid_object_position(object_center_meters):
                 self.previous_object_center_meters = object_center_meters
                 self.previous_object_timestamp = current_timestamp
-
-
+                    
             cv2.putText(annotated_image, f"Frame {self.frame_count}", (1150, 50),                                            
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
@@ -724,16 +669,15 @@ class SpeedDetNode(Node):
 
                 if remaining_cooldown > 0 and self.annotations_mode:
                     text_cooldown = f"CD: {remaining_cooldown:.1f}s"
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 2.2  # Très gros pour voir de très loin !
-                    thickness = 6     # Écriture très épaisse
-                    color_orange = (0, 140, 255) # Orange vif en format BGR (OpenCV)
                     
-                    # Calcul dynamique de la taille du texte pour le caler parfaitement
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 2.2 
+                    thickness = 6
+                    color_orange = (0, 140, 255) 
+                    
                     text_size, _ = cv2.getTextSize(text_cooldown, font, font_scale, thickness)
                     text_w, text_h = text_size
                     
-                    # Positionnement avec une marge de 40 pixels des bords droit et bas
                     pos_x = w_color - text_w - 40
                     pos_y = h_color - 40
                     
@@ -745,7 +689,7 @@ class SpeedDetNode(Node):
                 y_csv = round(ry_world, 4) if ry is not None else ""
                 z_csv = round(rz_world, 4) if rz is not None else ""
                 self.csv_writer.writerow([self.frame_count, round(current_timestamp, 4), x_csv, y_csv, z_csv, object_speed_csv, self.throw_detected])
-                if self.frame_count % 30 == 0:  # ~1x/seconde a 30fps : limite la perte de donnees en cas de crash sans flusher a chaque frame
+                if self.frame_count % 30 == 0: 
                     self.csv_file.flush()
 
             if self.record_mode:
@@ -778,9 +722,7 @@ class SpeedDetNode(Node):
             self.get_logger().info(f"Error in the synchronized callback : {e}")
 
     def destroy_node(self):
-            # Si le node s'arrete pendant qu'un lancer est encore en cours de suivi
-            # (objet sorti du champ avant l'atterrissage, ECHAP/Ctrl+C premature...),
-            # on sauvegarde quand meme ce qui a ete observe/predit au lieu de le perdre.
+            
             if getattr(self, 'trajectory_tracking_active', False) and self.trajectory_observed:           
                 self.get_logger().info("\nNode shutting down with an active throw: saving partial trajectory plot...")
                 self.trajectory_tracking_active = False

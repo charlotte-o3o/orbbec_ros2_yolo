@@ -4,6 +4,7 @@ cyclonedds_host.xml
 yolo26n.pt
 yolov8s-world.pt
 stgcn_lancer.pt
+*.pth
 
 build/
 captures_videos/
@@ -27,3 +28,4 @@ collect_data_node.py
 double_detection_node.py
 mathematical_throw_detection_node.py
 test_subscriber_node.py
+lstm_node.py

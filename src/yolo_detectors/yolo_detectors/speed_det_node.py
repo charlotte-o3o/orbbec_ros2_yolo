@@ -128,7 +128,7 @@ class SpeedDetNode(Node):
 
         # --- Bornes physiques verticales (repere: Y positif = vers le bas, Y negatif = vers le haut) ---
         # A adapter a ta piece/setup si besoin.
-        self.max_predicted_height = 3.0   # m, Y ne doit jamais monter en dessous de ca (2m au-dessus de l'origine camera)
+        self.max_predicted_height = 2.0   # m, Y ne doit jamais monter en dessous de ca (2m au-dessus de l'origine camera)
         self.max_predicted_fall = -2.0      # m, Y ne doit jamais depasser ca vers le bas (sol/limite basse plausible)
 
         self.camera_tilt_deg = 0.0  # Ajuste l'angle réel de ton trépied ici
@@ -220,11 +220,12 @@ class SpeedDetNode(Node):
             - raw_trajectory (list ou None) : points futurs prédits [(t, x, y, z), ...]
             - vx_moy (float) : vitesse moyenne estimée sur X
             - vz_moy (float) : vitesse moyenne estimée sur Z
-            - y_at_landing (float ou None) : Hauteur Y estimée au plan Z = 0.1m
-            - time_to_landing (float ou None) : Temps restant (en s) avant d'atteindre la caméra
+            - x_at_landing (float ou None) : Position X estimée au plan Z = 0.0m
+            - y_at_landing (float ou None) : Hauteur Y estimée au plan Z = 0.0m
+            - time_to_landing (float ou None) : Temps restant (en s) avant d'atteindre la caméra (Z = 0.0m)
             """
         if len(self.trajectory_observed) < 3:
-            return None, 0.0, 0.0, 0.0, 0.0
+            return None, 0.0, 0.0, 0.0, 0.0, 0.0
 
         ts = np.array([p[0] for p in self.trajectory_observed])
         xs = np.array([p[1] for p in self.trajectory_observed])
@@ -240,7 +241,7 @@ class SpeedDetNode(Node):
 
         # Si le vecteur Z global pointe dans le mauvais sens, prédiction invalide
         if vz_moy >= -0.05:
-            return None, vx_moy, vz_moy, 0.0, 0.0
+            return None, vx_moy, vz_moy, 0.0, 0.0, 0.0
 
         # Ajustement gravitationnel de Y (repère Y positif vers le haut)
         ys_adjusted = ys + 0.5 * g_const * (ts ** 2)
@@ -258,6 +259,7 @@ class SpeedDetNode(Node):
         time_to_landing = t_landing - t_since_start
         
         # Calcul de la hauteur Y_world exacte à cet instant précis
+        x_at_landing = poly_x[0] * t_landing + poly_x[1]
         y_at_landing = -0.5 * g_const * (t_landing ** 2) + poly_y[0] * t_landing + poly_y[1]
         # ==========================================
 
@@ -289,23 +291,26 @@ class SpeedDetNode(Node):
             last_y = last_point[2]
             last_z = last_point[3]
 
-            if last_y <= self.max_predicted_fall and last_z > (self.landing_z_threshold + 0.30):
+            if last_y <= self.max_predicted_fall and last_z > (self.landing_z_threshold + 0.10):
                 self.get_logger().warn(
                     f"Trajectory prediction rejected (cliff effect): object hit the floor at Z={last_z:.2f}m "
                     f"instead of reaching the camera | estimated vz: {vz_moy:.3f} m/s"
                 )
-                return None, vx_moy, vz_moy, 0.0, 0.0
+                return None, vx_moy, vz_moy, 0.0, 0.0, 0.0
 
-        return raw_trajectory, vx_moy, vz_moy, y_at_landing, time_to_landing
+        return raw_trajectory, vx_moy, vz_moy, x_at_landing, y_at_landing, time_to_landing
 
     def plot_trajectory_history(self):
         if not self.trajectory_observed and not self.trajectory_history:
             self.get_logger().warn("No trajectory data to plot.")
             return
 
-        plt.figure(figsize=(8, 6))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
 
-        plt.gca().invert_xaxis()
+        ax1.invert_xaxis()
+        ax2.invert_xaxis()
+
+        frame_label = f"frame {self.trajectory_start_frame}" if self.trajectory_start_frame is not None else "frame ?"
 
         # 1) Trajectoire REELLEMENT observee depuis le premier point du lancer
         #    -> une seule courbe continue, c'est la "verite terrain"
@@ -313,8 +318,10 @@ class SpeedDetNode(Node):
             xs_obs = [point[1] for point in self.trajectory_observed]
             ys_obs = [point[2] for point in self.trajectory_observed]
             zs_obs = [point[3] for point in self.trajectory_observed]
-            plt.plot(zs_obs, ys_obs, color='black',
+            ax1.plot(zs_obs, ys_obs, color='black',
                       marker='o', markersize=3, label="Observed points", zorder=5)
+            ax2.plot(zs_obs, xs_obs, color='black',
+                     marker='o', markersize=3, label="Observed points", zorder=5)
 
         # 2) Predictions echantillonnees (une toutes les N frames, pas toutes)
         #    -> montre l'evolution de la prediction sans que tout se superpose
@@ -322,7 +329,9 @@ class SpeedDetNode(Node):
             xs = [point[1] for point in traj]
             ys = [point[2] for point in traj]
             zs = [point[3] for point in traj]
-            plt.plot(zs, ys, alpha=0.35, linestyle='--', color='tab:blue',
+            ax1.plot(zs, ys, alpha=0.35, linestyle='--', color='tab:blue',
+                      label="Predictions" if i == 0 else None)
+            ax2.plot(zs, xs, alpha=0.35, linestyle='--', color='tab:blue',
                       label="Predictions" if i == 0 else None)
 
         # 3) Derniere prediction "vivante" mise en avant
@@ -330,26 +339,33 @@ class SpeedDetNode(Node):
             xs_last = [point[1] for point in self.predicted_trajectory]
             ys_last = [point[2] for point in self.predicted_trajectory]
             zs_last = [point[3] for point in self.predicted_trajectory]
-            plt.plot(zs_last, ys_last, color='tab:red', linewidth=1.5,
+            ax1.plot(zs_last, ys_last, color='tab:red', linewidth=1.5,
+                      label="Last prediction", zorder=4)
+            ax2.plot(zs_last, xs_last, color='tab:red', linewidth=1.5,
                       label="Last prediction", zorder=4)
 
-        # Annotation du numero de frame du premier point du lancer, pour retrouver
-        # facilement a quel lancer de la video ce graphique correspond.
-        frame_label = f"frame {self.trajectory_start_frame}" if self.trajectory_start_frame is not None else "frame ?"
         if self.trajectory_observed:
-            plt.annotate(f"debut : {frame_label}",
+            ax1.annotate(f"debut : {frame_label}",
                           xy=(zs_obs[0], ys_obs[0]),
                           xytext=(10, 10), textcoords='offset points',
                           fontsize=9, color='black',
                           bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='black', alpha=0.8))
 
-        plt.xlabel("Z (m)")
-        plt.ylabel("Y (m)")
-        plt.title(f"Trajectoire observee vs predictions ({frame_label})")
-        plt.legend(loc='best', fontsize=8)
-        plt.grid(True)
+        ax1.set_xlabel("Z (m)")
+        ax1.set_ylabel("Y (m)")
+        ax1.set_title(f"Profil vertical ({frame_label})")
+        ax1.legend(loc='best', fontsize=8)
+        ax1.grid(True)
+        ax1.set_ylim(self.max_predicted_fall, self.max_predicted_height)
 
-        plt.ylim(self.max_predicted_fall, self.max_predicted_height)
+        ax2.set_xlabel("Z (m)")
+        ax2.set_ylabel("X (m)")
+        ax2.set_title(f"Profil horizontal ({frame_label})")
+        ax2.legend(loc='best', fontsize=8)
+        ax2.grid(True)
+        ax2.set_ylim(-1.5, 1.5)
+
+        plt.tight_layout()
 
         plot_dir = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "speed_detection", "trajectory_plots")
         if not os.path.exists(plot_dir):
@@ -361,9 +377,6 @@ class SpeedDetNode(Node):
 
         self.get_logger().info(f"\nTrajectory plot saved : {plot_path}")
 
-        # On vide l'historique juste apres la sauvegarde pour ne jamais melanger
-        # les donnees d'un lancer avec celles du suivant (et eviter un double-plot
-        # avec les memes donnees si deux conditions d'arret se declenchent d'affilee).
         self.trajectory_observed = []
         self.trajectory_history = []
         self.predicted_trajectory = None
@@ -461,6 +474,11 @@ class SpeedDetNode(Node):
 
             current_timestamp = time.time() - self.start_time
             object_speed_csv = 0.0
+            remaining_time = self.startup_grace_period - current_timestamp
+
+            if remaining_time > 0 and self.annotations_mode:
+                cv2.putText(annotated_image, f"WARMING UP ({remaining_time:.1f}s)", (30, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 165, 255), 3)
 
             if object_center_meters is not None and None not in object_center_meters:
                 rx, ry, rz = object_center_meters
@@ -502,29 +520,23 @@ class SpeedDetNode(Node):
                 self.last_timestamp = current_timestamp
                 object_speed_csv = round(object_speed_m_s, 4) 
 
-                remaining_time = self.startup_grace_period - current_timestamp
-                if remaining_time <= 0 and object_speed_m_s >= self.speed_threshold and vrz < 0:
-                    self.throw_confirm_counter += 1
+                if remaining_time <= 0:
+                    if object_speed_m_s >= self.speed_threshold and vrz < 0:
+                        self.throw_confirm_counter += 1
 
-                    if self.throw_confirm_counter >= self.throw_confirm_frames:
-                        self.false_frame_counter = 0
-                        self.throw_detected = True
+                        if self.throw_confirm_counter >= self.throw_confirm_frames:
+                            self.false_frame_counter = 0
+                            self.throw_detected = True
 
-                        if self.annotations_mode:
-                                    cv2.putText(annotated_image, f"THROW", (30, 50),                                        
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-
-                elif remaining_time > 0:
-                    if self.annotations_mode:
-                        remaining = self.startup_grace_period - current_timestamp
-                        cv2.putText(annotated_image, f"WARMING UP ({remaining:.1f}s)", (30, 50),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 165, 255), 3)
-                        
-                else:   # if remaining_time <= 0 but not (object_speed_m_s >= self.speed_threshold and vrz < 0):
-                    self.throw_confirm_counter = 0
-                    self.false_frame_counter += 1                    
-                    if self.false_frame_counter >= self.max_false_frames_allowed:
-                        self.throw_detected = False
+                            if self.annotations_mode:
+                                        cv2.putText(annotated_image, f"THROW", (30, 50),                                        
+                                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                            
+                    else:   # if remaining_time <= 0 but not (object_speed_m_s >= self.speed_threshold and vrz < 0):
+                        self.throw_confirm_counter = 0
+                        self.false_frame_counter += 1                    
+                        if self.false_frame_counter >= self.max_false_frames_allowed:
+                            self.throw_detected = False
 
                 if self.throw_detected is True and self.previous_throw_detected is not True and not self.trajectory_tracking_active:
                     time_since_last_throw = current_timestamp - self.last_throw_trigger_time
@@ -602,9 +614,9 @@ class SpeedDetNode(Node):
                                 rz_world
                             ))
 
-                        if len(self.trajectory_observed) >= 3 and len(self.trajectory_observed) % 2 == 0:
+                        if len(self.trajectory_observed) >= 4 and len(self.trajectory_observed) % 2 == 0:
                             dt_frame = dt if dt is not None else (1.0 / self.fps_camera)
-                            raw_trajectory, vx_moy, vz_moy, y_at_landing, time_to_landing = self.predict_smoothed_trajectory(t_since_start, dt_frame)
+                            raw_trajectory, vx_moy, vz_moy, x_at_landing, y_at_landing, time_to_landing = self.predict_smoothed_trajectory(t_since_start, dt_frame)
 
                             if raw_trajectory is None:
                                 if vz_moy >= -0.05:
@@ -627,7 +639,7 @@ class SpeedDetNode(Node):
                                     f"Vx moy: {vx_moy:.2f}m/s | Vz moy: {vz_moy:.2f}m/s"
                                 )
                                 self.get_logger().info(
-                                    f"[PRED] Y_landing: {y_at_landing:.2f}m | Impact in: {time_to_landing:.3f}s"
+                                    f"[PRED] X_landing: {x_at_landing:.2f}m | Y_landing: {y_at_landing:.2f}m | Impact in: {time_to_landing:.3f}s"
                                 )   
 
                         time_tracked = current_timestamp - self.trajectory_start_time

@@ -131,8 +131,8 @@ ros2_orbbec_ws/
 │       └── test/
 ├── weights/                      # Model weights
 │   ├── yolo26n-pose.pt
-│   ├── alien_plushie_v4.pt
-│   └── throw_lstm_v8.pth
+│   ├── alien_plushie_v5.pt
+│   └── throw_lstm_v9.pth
 ├── requirements.txt
 ├── setup_env.sh
 └── cyclonedds_host.xml

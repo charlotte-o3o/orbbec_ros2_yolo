@@ -27,3 +27,4 @@ collect_data_node.py
 double_detection_node.py
 mathematical_throw_detection_node.py
 test_subscriber_node.py
+speed_det_node.py

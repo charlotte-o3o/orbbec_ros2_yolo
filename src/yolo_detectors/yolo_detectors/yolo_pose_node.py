@@ -41,8 +41,10 @@ class YoloPoseNode(Node):
             (5, 11), (6, 12), (11, 12),               # Tronc (Épaules vers Hanches)
             (11, 13), (13, 15), (12, 14), (14, 16)    # Jambes (Hanches, Genoux, Chevilles)
         ]
-        self.line_color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
-        self.circle_color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
+        #self.line_color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
+        self.line_color = (177, 220, 0)
+        #self.circle_color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
+        self.circle_color = (150, 75, 255)
 
         self.get_logger().info("*** YOLO-Pose Node Launched successfully ***")
 

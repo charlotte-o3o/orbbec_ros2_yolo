@@ -43,6 +43,7 @@ class FineTuneYoloNode(Node):
         # --- Initialisation du convertisseur CvBridge
         self.bridge = CvBridge()
         self.distance_history: list[float] = []
+        self.consecutive_jumps = 0
         self.box_color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
 
         self.get_logger().info("*** YOLO Node Launched successfully ***")
@@ -138,8 +139,8 @@ class FineTuneYoloNode(Node):
 
                     # --- Valeur max pour la marge : 0.5 => pixel central uniquement
                     # --- 0.375 => 25% de la BB d'origine
-                    margin_x = int((x2 - x1) * 0.375)                         
-                    margin_y = int((y2 - y1) * 0.375)     
+                    margin_x = int((x2 - x1) * 0.46)                         
+                    margin_y = int((y2 - y1) * 0.46)     
 
                     y1_p = max(0, y1 + margin_y)  
                     y2_p = min(cv_depth_image.shape[0], y2 - margin_y)    
@@ -163,7 +164,17 @@ class FineTuneYoloNode(Node):
 
                     if distance > 0 and len(self.distance_history) > 0:
                         if abs(distance - self.distance_history[-1]) > self.max_jump:
-                            distance = self.distance_history[-1]  
+                            self.consecutive_jumps += 1
+
+                            if self.consecutive_jumps > 10:
+                                self.get_logger().warn("Filtre Z bloqué détecté ! Réinitialisation de l'historique.")
+                                self.distance_history.clear()
+                                self.consecutive_jumps = 0
+                            else:
+                                distance = self.distance_history[-1]  
+
+                        else:
+                            self.consecutive_jumps = 0
 
                     if distance > 0:                              
                         self.distance_history.append(distance)   

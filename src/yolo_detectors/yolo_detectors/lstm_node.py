@@ -19,6 +19,7 @@ import cv2
 import random
 import csv
 import time
+from datetime import datetime
 import torch
 import torch.nn as nn
 
@@ -42,10 +43,11 @@ class LSTMNode(Node):
     def __init__(self):
         super().__init__('lstm_node')
 
-        self.get_logger().info("*** Mathematical Throw Detection Node Launched ***")
+        self.get_logger().info("*** LSTM Throw Detection Node Launched ***")
 
         self.save_distance_mode = True
         self.record_mode = True
+        self.annotations_mode = True
 
         self.bridge = CvBridge()
 
@@ -69,7 +71,7 @@ class LSTMNode(Node):
         
         if self.save_distance_mode:
             self.get_logger().info("Distances save mode ON.")
-            self.distance_log_dir = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "csv_distances")
+            self.distance_log_dir = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "lstm", "csv_distances")
             if not os.path.exists(self.distance_log_dir):
                 os.makedirs(self.distance_log_dir)
                 self.get_logger().info(f"Directory created: {self.distance_log_dir}")                     
@@ -78,7 +80,7 @@ class LSTMNode(Node):
 
             with open(self.csv_path, mode='w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['frame', 'timestamp', 'dist_object_m', 'distance_left_wrist_m', 'distance_right_wrist_m', 'label'])
+                writer.writerow(['frame', 'timestamp', 'object_speed_m_s', 'distance_left_wrist_m', 'distance_right_wrist_m', 'label'])
 
             self.get_logger().info(f"CSV file created : {self.csv_path}")
 
@@ -114,6 +116,11 @@ class LSTMNode(Node):
         self.previous_object_center_meters = None
         self.previous_object_timestamp = None
 
+        self.smoothed_object_meters = None
+        self.alpha_smooth = 0.6            
+        self.last_object_meters = None
+        self.last_timestamp = None
+
         self.cooldown_duration = 3.0   
         self.last_throw_trigger_time = 0.0 
         
@@ -121,10 +128,32 @@ class LSTMNode(Node):
         self.max_false_frames_allowed = 10
 
         self.trajectory_tracking_active = False
-        self.predicted_trajectory = None
+        self.predicted_trajectory = None          # Derniere prediction "vivante" (une seule courbe, ecrasee a chaque frame)
         self.trajectory_start_time = None
+        self.trajectory_start_frame = None         # numero de frame du premier point du lancer (pour retrouver le lancer dans la video)
         self.trajectory_tracking_duration = 3.0
-        self.trajectory_history = []
+        self.trajectory_observed = []              # Points REELLEMENT mesures depuis le debut du lancer (t, x, y, z)
+        self.trajectory_history = []                # Predictions echantillonnees (pour visualiser l'evolution, pas toutes les frames)
+        self.history_sampling_interval = 0.10        # secondes entre deux predictions archivees (independant du fps)
+        self.last_history_sample_time = None
+
+        # --- Garde-fous physiques : toute position/mise a jour hors de ces bornes est rejetee ---
+        self.min_valid_z = 0.05        # m, en dessous : profondeur invalide/trop proche
+        self.max_valid_z = 10.0        # m, au-dela : profondeur aberrante
+        self.max_valid_xy = 5.0        # m, deplacement lateral/vertical plausible dans la piece
+        self.min_valid_dt = 0.01       # s, en dessous : bruit temporel -> vitesse qui explose
+        self.max_valid_speed = 25.0    # m/s, au-dela : vitesse non physique pour un lancer a la main
+
+        # --- Debounce pour la detection d'atterrissage : evite un arret sur la 1ere frame ---
+        self.landing_z_threshold = 0.1                  # m, objet considere "arrive" quand il est a moins de 10cm de la camera
+        self.min_time_before_landing_check = 0.15       # s, temps minimum de suivi avant d'autoriser la detection d'atterrissage
+        self.landing_confirm_frames = 3                 # nb de frames consecutives sous le seuil pour confirmer
+        self.landing_confirm_counter = 0
+
+        # --- Bornes physiques verticales (repere: Y positif = vers le bas, Y negatif = vers le haut) ---
+        # A adapter a ta piece/setup si besoin.
+        self.max_predicted_height = -2.0   # m, Y ne doit jamais monter en dessous de ca (2m au-dessus de l'origine camera)
+        self.max_predicted_fall = 3.0      # m, Y ne doit jamais depasser ca vers le bas (sol/limite basse plausible)
 
         # Détecter si on a une carte graphique NVIDIA, sinon utiliser le processeur
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -133,7 +162,7 @@ class LSTMNode(Node):
         self.model = ThrowLSTM(input_size=6, num_classes=2).to(self.device)
         
         # Définis ici le chemin exact vers ton fichier throw_lstm.pth
-        model_path = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "weights", "throw_lstm_v6.pth")
+        model_path = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "weights", "throw_lstm_v9.pth")
         
         try:
             # Chargement des poids
@@ -197,6 +226,31 @@ class LSTMNode(Node):
 
             self.destroy_subscription(self.sub_info)  # Unsubscribe after receiving camera info
 
+    def is_valid_object_position(self, position_meters):
+        """
+        Verifie que la position 3D (x, y, z) en metres est physiquement plausible
+        avant de l'utiliser pour ancrer une trajectoire. C'est ce garde-fou qui
+        manquait et qui laissait passer des positions aberrantes (ex: Y=0 par
+        defaut ou Y=-120 issu d'une profondeur corrompue) directement dans les
+        predictions.
+        """
+        if position_meters is None or None in position_meters:
+            return False
+
+        x, y, z = position_meters
+
+        if any(v != v for v in (x, y, z)):  # test NaN (NaN != NaN)
+            return False
+        if any(abs(v) == float('inf') for v in (x, y, z)):
+            return False
+
+        if not (self.min_valid_z <= z <= self.max_valid_z):
+            return False
+        if abs(x) > self.max_valid_xy or abs(y) > self.max_valid_xy:
+            return False
+
+        return True
+
     def predict_parabolic_trajectory(self, x0, y0, z0, vx0, vy0, vz0,
                                   g=9.81, dt=None, z_camera=0.3):
         """
@@ -217,6 +271,13 @@ class LSTMNode(Node):
             y = 0.5 * g * (t ** 2) + vy0 * t + y0
             z = vz0 * t + z0
 
+            # Garde-fou physique : on arrete l'integration des qu'elle sort d'une
+            # plage plausible plutot que de laisser le carre en t^2 diverger vers
+            # des dizaines de metres a cause d'une vitesse initiale bruitee.
+            if y < self.max_predicted_height or y > self.max_predicted_fall:
+                trajectory.append((t, x, y, z))
+                break
+
             trajectory.append((t, x, y, z))
 
             if z <= z_camera and t > 0:
@@ -227,32 +288,80 @@ class LSTMNode(Node):
         return trajectory
     
     def plot_trajectory_history(self):
-        if not self.trajectory_history:
-            self.get_logger().warn("No trajectory history to plot.")
+        if not self.trajectory_observed and not self.trajectory_history:
+            self.get_logger().warn("No trajectory data to plot.")
             return
 
         plt.figure(figsize=(8, 6))
 
+        # 1) Trajectoire REELLEMENT observee depuis le premier point du lancer
+        #    -> une seule courbe continue, c'est la "verite terrain"
+        if self.trajectory_observed:
+            xs_obs = [point[1] for point in self.trajectory_observed]
+            ys_obs = [-point[2] for point in self.trajectory_observed]
+            zs_obs = [-point[3] for point in self.trajectory_observed]
+            plt.plot(zs_obs, ys_obs, color='black', linewidth=2.5,
+                      marker='o', markersize=3, label="Trajectoire observee", zorder=5)
+
+        # 2) Predictions echantillonnees (une toutes les N frames, pas toutes)
+        #    -> montre l'evolution de la prediction sans que tout se superpose
         for i, traj in enumerate(self.trajectory_history):
-            # traj est une liste de tuples (t, x, y, z)
             xs = [point[1] for point in traj]
             ys = [-point[2] for point in traj]
             zs = [-point[3] for point in traj]
-            plt.plot(zs, ys, alpha=0.5, label=f"Prediction {i+1}" if i % 5 == 0 else None)
+            plt.plot(zs, ys, alpha=0.35, linestyle='--', color='tab:blue',
+                      label="Predictions (echantillonnees)" if i == 0 else None)
+
+        # 3) Derniere prediction "vivante" mise en avant
+        if self.predicted_trajectory:
+            xs_last = [point[1] for point in self.predicted_trajectory]
+            ys_last = [-point[2] for point in self.predicted_trajectory]
+            zs_last = [-point[3] for point in self.predicted_trajectory]
+            plt.plot(zs_last, ys_last, color='tab:red', linewidth=1.5,
+                      label="Derniere prediction", zorder=4)
+
+        # Annotation du numero de frame du premier point du lancer, pour retrouver
+        # facilement a quel lancer de la video ce graphique correspond.
+        frame_label = f"frame {self.trajectory_start_frame}" if self.trajectory_start_frame is not None else "frame ?"
+        if self.trajectory_observed:
+            plt.annotate(f"debut : {frame_label}",
+                          xy=(zs_obs[0], ys_obs[0]),
+                          xytext=(10, 10), textcoords='offset points',
+                          fontsize=9, color='black',
+                          bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='black', alpha=0.8))
 
         plt.xlabel("Z (m)")
         plt.ylabel("Y (m)")
-        plt.title("Predicted trajectories")
+        plt.title(f"Trajectoire observee vs predictions ({frame_label})")
+        plt.legend(loc='best', fontsize=8)
         plt.grid(True)
 
-        plot_dir = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "lstm","trajectory_plots")
+        # Echelle verticale fixe, alignee sur les memes bornes physiques que
+        # celles utilisees pour couper l'integration (avec le signe inverse
+        # car ys/zs sont affiches negatifs par rapport a y/z bruts).
+        plt.ylim(-self.max_predicted_fall, -self.max_predicted_height)
+
+        plot_dir = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "lstm", "trajectory_plots")
         if not os.path.exists(plot_dir):
             os.makedirs(plot_dir)
-        plot_path = os.path.join(plot_dir, f"trajectories_{time.strftime('%Y-%m-%d_%H-%M-%S')}.png")
+        # NB: time.strftime ne supporte pas %f (microsecondes) contrairement a
+        # datetime.strftime -> on utilise datetime pour avoir un nom de fichier
+        # correct (auparavant ca produisait litteralement "..._%f.png").
+        timestamp_str = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        frame_tag = f"frame{self.trajectory_start_frame}" if self.trajectory_start_frame is not None else "frameUNK"
+        plot_path = os.path.join(plot_dir, f"trajectories_{timestamp_str}_{frame_tag}.png")
         plt.savefig(plot_path)
         plt.close()
 
         self.get_logger().info(f"Trajectory plot saved : {plot_path}")
+
+        # On vide l'historique juste apres la sauvegarde pour ne jamais melanger
+        # les donnees d'un lancer avec celles du suivant (et eviter un double-plot
+        # avec les memes donnees si deux conditions d'arret se declenchent d'affilee).
+        self.trajectory_observed = []
+        self.trajectory_history = []
+        self.predicted_trajectory = None
+        self.last_history_sample_time = None
 
 
     def synchronized_callback(self, color_msg, depth_msg, yolo_objects, yolo_poses):
@@ -289,8 +398,9 @@ class LSTMNode(Node):
                 x2 = int(x_center + size_x / 2)
                 y2 = int(y_center + size_y / 2)
 
-                #cv2.rectangle(annotated_image, (x1, y1), (x2, y2), self.box_color, 2)
-                cv2.circle(annotated_image, (int(x_center), int(y_center)), 8, self.box_color, -1)
+                if self.annotations_mode:
+                    #cv2.rectangle(annotated_image, (x1, y1), (x2, y2), self.box_color, 2)
+                    cv2.circle(annotated_image, (int(x_center), int(y_center)), 8, self.box_color, -1)
 
                 if len(detection.results) > 0:
                     # On récupère le premier résultat (l'hypothèse principale de YOLO)
@@ -306,10 +416,11 @@ class LSTMNode(Node):
                     conf = result.hypothesis.score * 100
                     z_dist = result.pose.pose.position.z
                     
-                    custom_label = f"{label} ({conf:.1f}%) | Z: {z_dist:.3f}m"
-                    cv2.putText(annotated_image, custom_label, (x1, y1 - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, self.box_color, 2)
-                    
+                    if self.annotations_mode:
+                        custom_label = f"{label} ({conf:.1f}%) | Z: {z_dist:.3f}m"
+                        cv2.putText(annotated_image, custom_label, (x1, y1 - 10),                                 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, self.box_color, 2)
+                        
             for pose in yolo_poses.poses:
                 kpts = pose.keypoints
 
@@ -321,9 +432,10 @@ class LSTMNode(Node):
                     lw_y = max(0, min(lw_y, h - 1))
                     lw_pixels = (lw_x, lw_y)
 
-                    cv2.circle(annotated_image, (lw_x, lw_y), 8, self.left_wrist_color, -1)
-                    cv2.putText(annotated_image, "LEFT WRIST", (lw_x + 10, lw_y + 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, self.left_wrist_color, 3)
+                    if self.annotations_mode:
+                        cv2.circle(annotated_image, (lw_x, lw_y), 8, self.left_wrist_color, -1)
+                        cv2.putText(annotated_image, "LEFT WRIST", (lw_x + 10, lw_y + 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, self.left_wrist_color, 3)
 
                     lw_z_m = cv_depth_image[lw_y, lw_x] / 1000.0
 
@@ -343,9 +455,10 @@ class LSTMNode(Node):
                     rw_y = max(0, min(rw_y, h - 1))
                     rw_pixels = (rw_x, rw_y)
 
-                    cv2.circle(annotated_image, (rw_x, rw_y), 8, self.right_wrist_color, -1)
-                    cv2.putText(annotated_image, "RIGHT WRIST", (rw_x + 10, rw_y + 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, self.right_wrist_color, 3)
+                    if self.annotations_mode:
+                        cv2.circle(annotated_image, (rw_x, rw_y), 8, self.right_wrist_color, -1)
+                        cv2.putText(annotated_image, "RIGHT WRIST", (rw_x + 10, rw_y + 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, self.right_wrist_color, 3)
 
                     rw_z_m = cv_depth_image[rw_y, rw_x] / 1000.0
 
@@ -391,21 +504,43 @@ class LSTMNode(Node):
                 if rw_pixels is not None and None not in rw_pixels:
                     hold_connections.append((object_center_pixels, rw_pixels))
 
-                for pt1, pt2 in hold_connections:
-                    cv2.line(annotated_image, pt1, pt2, (0, 255, 255), 2)
+                if self.annotations_mode:
+                    for pt1, pt2 in hold_connections:
+                        cv2.line(annotated_image, pt1, pt2, (0, 255, 255), 2)
 
             current_timestamp = time.time() - self.start_time
-            object_z_csv = ""
+            object_speed_csv = 0.0
             left_dist_csv = ""
             right_dist_csv = ""
 
             current_left_dist = None
             current_right_dist = None
-            current_obj_z = None
 
             if object_center_meters is not None and None not in object_center_meters:
-                object_z_csv = round(object_center_meters[2], 4)
-                current_obj_z = object_center_meters[2]
+                
+                if self.smoothed_object_meters is None:
+                    self.smoothed_object_meters = list(object_center_meters)
+                else:
+                    self.smoothed_object_meters[0] = self.alpha_smooth * object_center_meters[0] + (1 - self.alpha_smooth) * self.smoothed_object_meters[0]
+                    self.smoothed_object_meters[1] = self.alpha_smooth * object_center_meters[1] + (1 - self.alpha_smooth) * self.smoothed_object_meters[1]
+                    self.smoothed_object_meters[2] = self.alpha_smooth * object_center_meters[2] + (1 - self.alpha_smooth) * self.smoothed_object_meters[2]
+
+
+                object_speed_m_s = 0.0
+                if self.last_object_meters is not None and self.last_timestamp is not None:
+                    dt = current_timestamp - self.last_timestamp
+                    if dt > 0:
+                        dx = self.smoothed_object_meters[0] - self.last_object_meters[0]
+                        dy = self.smoothed_object_meters[1] - self.last_object_meters[1]
+                        dz = self.smoothed_object_meters[2] - self.last_object_meters[2]
+                        # Distance parcourue en 3D divisée par le temps écoulé
+                        object_speed_m_s = (dx**2 + dy**2 + dz**2)**0.5 / dt
+                
+                # Sauvegarde pour la frame suivante
+                self.last_object_meters = list(self.smoothed_object_meters)
+                self.last_timestamp = current_timestamp
+                object_speed_csv = round(object_speed_m_s, 4)
+            
 
                 if lw_meters is not None and None not in lw_meters:
                     left_dist_m = ((object_center_meters[0] - lw_meters[0]) ** 2 + 
@@ -417,8 +552,9 @@ class LSTMNode(Node):
                     left_line_center = ((object_center_pixels[0] + lw_pixels[0]) / 2,
                                         (object_center_pixels[1] + lw_pixels[1]) / 2)
                     
-                    cv2.circle(annotated_image, (int(left_line_center[0]), int(left_line_center[1])), 5, (0, 255, 255), -1)
-                    cv2.putText(annotated_image, f"{left_dist_m:.3f} m", (int(left_line_center[0]) + 1, int(left_line_center[1]) + 1),
+                    if self.annotations_mode:
+                        cv2.circle(annotated_image, (int(left_line_center[0]), int(left_line_center[1])), 5, (0, 255, 255), -1)
+                        cv2.putText(annotated_image, f"{left_dist_m:.3f} m", (int(left_line_center[0]) + 1, int(left_line_center[1]) + 1),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
                 if rw_meters is not None and None not in rw_meters:
@@ -431,10 +567,11 @@ class LSTMNode(Node):
                     right_line_center = ((object_center_pixels[0] + rw_pixels[0]) / 2,
                                          (object_center_pixels[1] + rw_pixels[1]) / 2)
                     
-                    cv2.circle(annotated_image, (int(right_line_center[0]), int(right_line_center[1])), 5, (0, 255, 255), -1)
-                    cv2.putText(annotated_image, f"{right_dist_m:.3f} m", (int(right_line_center[0]) + 1, int(right_line_center[1]) + 1),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    
+                    if self.annotations_mode:
+                        cv2.circle(annotated_image, (int(right_line_center[0]), int(right_line_center[1])), 5, (0, 255, 255), -1)
+                        cv2.putText(annotated_image, f"{right_dist_m:.3f} m", (int(right_line_center[0]) + 1, int(right_line_center[1]) + 1),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        
 
                     
             #########################################################
@@ -445,10 +582,10 @@ class LSTMNode(Node):
 
 
                    
-            if current_obj_z is not None and current_left_dist is not None and current_right_dist is not None:
+            if current_left_dist is not None and current_right_dist is not None:
                     
                     # 1. Position actuelle (3 features)
-                    current_features = [current_obj_z, current_left_dist, current_right_dist]
+                    current_features = [object_speed_m_s, current_left_dist, current_right_dist]
                     
                     # 2. Calcul des deltas (Vitesse)
                     if self.last_features is None:
@@ -488,8 +625,9 @@ class LSTMNode(Node):
                             self.false_frame_counter = 0  # On réinitialise, tout va bien
                             self.throw_detected = True    # Le lancer est actif
 
-                            cv2.putText(annotated_image, f"THROW ({conf_score*100:.0f}%)", (30, 50),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                            if self.annotations_mode:
+                                cv2.putText(annotated_image, f"THROW ({conf_score*100:.0f}%)", (30, 50),                                        
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
                             
                         else:
                             # 🟢 ANTI-REBOND : L'IA ne voit plus de lancer, mais on attend avant de paniquer
@@ -511,23 +649,29 @@ class LSTMNode(Node):
                                 
                                 self.get_logger().info(f"Throw started ({conf_score*100:.0f}%) : trajectory prediction start !")
 
-                                if object_center_meters is not None:
+                                if self.is_valid_object_position(object_center_meters):
                                     self.throw_coordinates = object_center_meters
                                     rx, ry, rz = self.throw_coordinates
 
-                                    coord_text = f"Obj: X:{rx:.3f}m, Y:{ry:.3f}m, Z:{rz:.3f}m"
-                                    cv2.putText(annotated_image, coord_text, (30, h_color - 50),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 1, self.box_color, 2)
+                                    if self.annotations_mode:
+                                        coord_text = f"Obj: X:{rx:.3f}m, Y:{ry:.3f}m, Z:{rz:.3f}m"
+                                        cv2.putText(annotated_image, coord_text, (30, h_color - 50),                                            
+                                                cv2.FONT_HERSHEY_SIMPLEX, 1, self.box_color, 2)
                                     
                                     self.get_logger().info(f"Initial throw point (frame {self.frame_count}) ---> X: {rx:.3f}m, Y: {ry:.3f}m, Z: {rz:.3f}m")
 
                                     self.trajectory_tracking_active = True
-                                    self.trajectory_start_time = current_timestamp                                
-                                    self.trajectory_history = []  
+                                    self.trajectory_start_time = current_timestamp
+                                    self.trajectory_start_frame = self.frame_count  # pour retrouver ce lancer dans la video/CSV
+                                    self.trajectory_observed = [(0.0,) + self.throw_coordinates]  # on ancre sur le VRAI premier point du lancer
+                                    self.trajectory_history = []
+                                    self.predicted_trajectory = None
+                                    self.last_history_sample_time = None
+                                    self.landing_confirm_counter = 0
 
                                 else:
                                     self.throw_coordinates = None
-                                    self.get_logger().warn("Throw detected but the object is invisible.")
+                                    self.get_logger().warn("Throw detected but the object is invisible or its position is not physically plausible (rejected).")
                                     
                             else:
                                 self.get_logger().info(f"Flickering detected ! New initial point blocked by cooldown ({self.cooldown_duration - time_since_last_throw:.1f}s left)")
@@ -540,67 +684,113 @@ class LSTMNode(Node):
                         self.previous_throw_detected = self.throw_detected
 
                         if self.trajectory_tracking_active:
-                            if (object_center_meters is not None
+                            stop_reason = None  # on ne s'arrete/plot qu'UNE fois par frame, quelle que soit la raison
+
+                            if (self.is_valid_object_position(object_center_meters)
                                     and self.previous_object_center_meters is not None
                                     and self.previous_object_timestamp is not None):
 
                                 rx, ry, rz = object_center_meters
                                 dt = current_timestamp - self.previous_object_timestamp
 
-                                if dt > 0:
+                                if dt >= self.min_valid_dt:
                                     vrx = (rx - self.previous_object_center_meters[0]) / dt
                                     vry = (ry - self.previous_object_center_meters[1]) / dt
                                     vrz = (rz - self.previous_object_center_meters[2]) / dt
+                                    speed = (vrx ** 2 + vry ** 2 + vrz ** 2) ** 0.5
 
-                                    self.predicted_trajectory = self.predict_parabolic_trajectory(
-                                        x0=rx, y0=ry, z0=rz,
-                                        vx0=vrx, vy0=vry, vz0=vrz,
-                                        dt=dt
-                                    )
+                                    if speed > self.max_valid_speed:
+                                        # Vitesse non physique (souvent un dt trop petit ou un saut de detection)
+                                        # -> on ignore cette mise a jour plutot que de generer une parabole aberrante
+                                        self.get_logger().warn(
+                                            f"Trajectory update rejected: implausible speed ({speed:.1f} m/s)."
+                                        )
+                                    elif vrz > 0:
+                                        # Dans ce repere, Z diminue quand l'objet se rapproche de la camera
+                                        # (vz doit donc etre negatif pendant un lancer valide). Un vz positif
+                                        # signifie que l'objet semble s'eloigner de la camera : c'est suspect
+                                        # (bruit de detection/profondeur) -> on rejette ce point.
+                                        self.get_logger().warn(
+                                            f"Trajectory update rejected: vz positive ({vrz:.3f} m/s), object seems to move away from the camera."
+                                        )
+                                    else:
+                                        # 1) On enregistre le point REELLEMENT observe (verite terrain)
+                                        t_since_start = current_timestamp - self.trajectory_start_time
+                                        self.trajectory_observed.append((t_since_start, rx, ry, rz))
 
-                                    self.trajectory_history.append(self.predicted_trajectory) 
+                                        # 2) On calcule la nouvelle prediction, qui REMPLACE la precedente
+                                        #    (une seule courbe "vivante", pas une accumulation de courbes superposees)
+                                        self.predicted_trajectory = self.predict_parabolic_trajectory(
+                                            x0=rx, y0=ry, z0=rz,
+                                            vx0=vrx, vy0=vry, vz0=vrz,
+                                            dt=dt
+                                        )
 
-                                    self.get_logger().info(
-                                        f"Trajectory updated (frame {self.frame_count}) ---> "
-                                        f"pos: X:{rx:.3f}m Y:{ry:.3f}m Z:{rz:.3f}m | "
-                                        f"vel: vx:{vrx:.3f} vy:{vry:.3f} vz:{vrz:.3f} m/s | "
-                                        f"{len(self.predicted_trajectory)} points predicted"
-                                    )
+                                        # 3) On n'archive qu'un echantillon des predictions (par intervalle de TEMPS,
+                                        #    pas par nombre de frames) pour visualiser leur evolution sans que tout
+                                        #    se superpose, meme sur un lancer court ou peu de frames valides.
+                                        if (self.last_history_sample_time is None
+                                                or (current_timestamp - self.last_history_sample_time) >= self.history_sampling_interval):
+                                            self.trajectory_history.append(self.predicted_trajectory)
+                                            self.last_history_sample_time = current_timestamp
 
-                                    if ry < 0.1:
-                                        self.trajectory_tracking_active = False
-                                        self.get_logger().info(f"Object landed (Y={ry:.3f}m < 0.1m). Trajectory tracking stopped.")                                           
-                                        self.plot_trajectory_history()     
+                                        self.get_logger().info(
+                                            f"Trajectory updated (frame {self.frame_count}) ---> "
+                                            f"pos: X:{rx:.3f}m Y:{ry:.3f}m Z:{rz:.3f}m | "
+                                            f"vel: vx:{vrx:.3f} vy:{vry:.3f} vz:{vrz:.3f} m/s | "
+                                            f"{len(self.predicted_trajectory)} points predicted"
+                                        )
+
+                                        # Garde-fou : la condition "atterrissage" ne doit jamais pouvoir
+                                        # se declencher sur la toute premiere frame du lancer (sinon on
+                                        # n'a jamais qu'un seul point observe, comme constate en pratique).
+                                        # On exige un minimum de temps de suivi ET une confirmation sur
+                                        # plusieurs frames consecutives avant de conclure a un atterrissage.
+                                        # NB: on se base sur rz (profondeur, se rapproche de la camera),
+                                        # PAS sur ry qui est presque toujours < seuil pendant tout le vol
+                                        # dans ce repere (Y negatif = vers le haut).
+                                        time_tracked = current_timestamp - self.trajectory_start_time
+                                        if rz < self.landing_z_threshold and time_tracked >= self.min_time_before_landing_check:
+                                            self.landing_confirm_counter += 1
+                                        else:
+                                            self.landing_confirm_counter = 0
+
+                                        if self.landing_confirm_counter >= self.landing_confirm_frames:
+                                            stop_reason = f"Object has reached the camera (Z={rz:.3f}m < {self.landing_z_threshold}m, confirmed)."
 
                                 else:
-                                    self.get_logger().warn("Cannot update trajectory: dt is zero or negative.")
+                                    self.get_logger().warn("Cannot update trajectory: dt too small or negative.")
 
                             else:
-                                self.get_logger().warn("Cannot update trajectory: missing current or previous object position.")
+                                self.get_logger().warn("Cannot update trajectory: missing/invalid current or previous object position.")
 
                             elapsed = current_timestamp - self.trajectory_start_time
-                            if elapsed >= self.trajectory_tracking_duration:
+                            if stop_reason is None and elapsed >= self.trajectory_tracking_duration:
+                                stop_reason = f"Trajectory tracking stopped after {elapsed:.2f}s."
+
+                            if stop_reason is not None:
                                 self.trajectory_tracking_active = False
-                                self.get_logger().info(f"Trajectory tracking stopped after {elapsed:.2f}s.")
+                                self.get_logger().info(stop_reason)
                                 self.plot_trajectory_history()
    
-                    self.previous_object_center_meters = object_center_meters
-                    self.previous_object_timestamp = current_timestamp
+                    if self.is_valid_object_position(object_center_meters):
+                        self.previous_object_center_meters = object_center_meters
+                        self.previous_object_timestamp = current_timestamp
 
             self.frame_count += 1
 
-            cv2.putText(annotated_image, f"Frame {self.frame_count}", (1150, 50),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(annotated_image, f"Frame {self.frame_count}", (1150, 50),                                            
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     
             if self.save_distance_mode:        
                 with open(self.csv_path, mode='a', newline='') as f:
                     writer = csv.writer(f)
-                    writer.writerow([self.frame_count, round(current_timestamp, 4), object_z_csv, left_dist_csv, right_dist_csv, ""])
+                    writer.writerow([self.frame_count, round(current_timestamp, 4), object_speed_csv, left_dist_csv, right_dist_csv, ""])
 
             if self.record_mode:
                 if self.video_writer is None:
                     self.record_path = os.path.join(self.video_folder,                   
-                                f"capture_{self.timestamp_csv}.avi")                                     
+                                f"{self.timestamp_csv}_lstm_det.avi")                                     
                     fourcc = cv2.VideoWriter_fourcc(*'MJPG')                    
                     self.video_writer = cv2.VideoWriter(self.record_path, fourcc, self.fps_camera, (w_color, h_color))
                     self.get_logger().info(f"Recording started : {self.record_path}")
@@ -609,7 +799,7 @@ class LSTMNode(Node):
                     self.video_writer.write(annotated_image)
 
             #cv2.putText(annotated_image, "Press ECHAP to quit", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            cv2.imshow("Combined YOLO Detections & Poses", annotated_image)
+            cv2.imshow("Combined YOLO Detections & Poses + LSTM", annotated_image)
             key = cv2.waitKey(1) & 0xFF
 
             if key == 27:
@@ -623,6 +813,14 @@ class LSTMNode(Node):
             self.get_logger().info(f"Error in the synchronized callback : {e}")
 
     def destroy_node(self):
+            # Si le node s'arrete pendant qu'un lancer est encore en cours de suivi
+            # (objet sorti du champ avant l'atterrissage, ECHAP/Ctrl+C premature...),
+            # on sauvegarde quand meme ce qui a ete observe/predit au lieu de le perdre.
+            if getattr(self, 'trajectory_tracking_active', False) and self.trajectory_observed:
+                self.get_logger().info("Node shutting down with an active throw: saving partial trajectory plot...")
+                self.trajectory_tracking_active = False
+                self.plot_trajectory_history()
+
             if hasattr(self, 'video_writer') and self.video_writer is not None:
                 self.video_writer.release()
                 self.get_logger().info("Record video saved and closed correctly.")

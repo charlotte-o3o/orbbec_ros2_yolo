@@ -134,8 +134,7 @@ ros2_orbbec_ws/
 │   ├── alien_plushie_v5.pt
 │   └── throw_lstm_v9.pth
 ├── requirements.txt
-├── setup_env.sh
-└── cyclonedds_host.xml
+└── setup_env.sh
 ```
 
 ## Requirements

@@ -27,6 +27,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Keypoint2D.msg"
   "msg/HumanPose.msg"
   "msg/HumanPoseArray.msg"
+  "msg/LandingPrediction.msg"
   DEPENDENCIES geometry_msgs std_msgs
 )
 

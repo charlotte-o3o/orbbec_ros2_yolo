@@ -22,7 +22,8 @@ class FineTuneYoloNode(Node):
     def __init__(self):
         super().__init__('fine_tune_yolo_node')
 
-        self.declare_parameter('model_path',  'weights/alien_plushie_v4.pt')
+        self.declare_parameter('model_path',  'weights/alien_plushie_v5.pt')
+        #self.declare_parameter('model_path',  'weights/books.pt')
         self.declare_parameter('confidence',  0.50)
         self.declare_parameter('max_history', 5)
         self.declare_parameter('max_jump',    2.0)
@@ -239,8 +240,10 @@ class FineTuneYoloNode(Node):
                 (0, 0, 255), 
                 2
                 )
+
+            display_image = cv2.flip(annotated_image, -1)
             
-            #cv2.imshow("BGR Image with YOLO", annotated_image)
+            #cv2.imshow("BGR Image with YOLO", display_image)
 
             depth_vis = cv2.normalize(cv_depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
             depth_colormap = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)

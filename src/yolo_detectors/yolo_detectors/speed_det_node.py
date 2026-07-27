@@ -7,6 +7,7 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;*.warning=false"
 
 import rclpy
 from rclpy.node import Node
+from lancer_interfaces.msg import HumanPoseArray, LandingPrediction
 from lancer_interfaces.msg import HumanPoseArray
 import message_filters
 from vision_msgs.msg import Detection2DArray
@@ -26,10 +27,10 @@ class SpeedDetNode(Node):
     def __init__(self):
         super().__init__('speed_det_node')
 
-        self.get_logger().info("*** Speed Throw Detection Node Launched ***")
+        self.get_logger().info("*** Speed Based Throw Detection Node Launched ***")
 
-        self.save_distance_mode = True
-        self.record_mode = True
+        self.save_distance_mode = False
+        self.record_mode = False
         self.annotations_mode = True
 
         self.bridge = CvBridge()
@@ -37,6 +38,10 @@ class SpeedDetNode(Node):
         self.box_color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))   
         self.right_wrist_color = (241, 255, 81)
         self.left_wrist_color = (218, 110, 255)
+
+        ######################################################################
+        #         CAMERA PARAMETERS (to be updated from CameraInfo)          #
+        ######################################################################
 
         self.fps_camera = 30.0
         self.fx = 616.0  # Focal length in pixels (x-axis)
@@ -49,6 +54,10 @@ class SpeedDetNode(Node):
 
         self.start_time = time.time()
         self.timestamp_csv = time.strftime("%Y-%m-%d_%H-%M-%S")
+
+        ######################################################################
+        #                                                                    #
+        ######################################################################
         
         if self.save_distance_mode:
             self.get_logger().info("Distances save mode ON.")
@@ -79,6 +88,10 @@ class SpeedDetNode(Node):
 
         else:
             self.get_logger().info("Record mode OFF.")
+
+        ######################################################################
+        #                                                                    #
+        ######################################################################
         
         self.throw_detected = False
         self.previous_throw_detected = False
@@ -87,7 +100,7 @@ class SpeedDetNode(Node):
         self.previous_object_timestamp = None
 
         self.smoothed_object_meters = None
-        self.alpha_smooth = 0.3       
+        self.alpha_smooth = 0.4       
         self.last_object_meters = None
         self.last_world_pos = None
         self.last_timestamp = None
@@ -131,8 +144,18 @@ class SpeedDetNode(Node):
         self.max_predicted_height = 2.0   # m, Y ne doit jamais monter en dessous de ca (2m au-dessus de l'origine camera)
         self.max_predicted_fall = -2.0      # m, Y ne doit jamais depasser ca vers le bas (sol/limite basse plausible)
 
-        self.camera_tilt_deg = 0.0  # Ajuste l'angle réel de ton trépied ici
+        self.camera_tilt_deg = 45.0  # Ajuste l'angle réel de ton trépied ici
         self.theta = np.radians(self.camera_tilt_deg)
+
+        ######################################################################
+        #                                                                    #
+        ######################################################################
+
+        self.pub_landing = self.create_publisher(
+            LandingPrediction,
+            '/trajectory/landing_prediction',
+            10
+        )
 
         self.sub_info = self.create_subscription(
             CameraInfo,
@@ -495,9 +518,10 @@ class SpeedDetNode(Node):
 
                 rx_cam, ry_cam, rz_cam = self.smoothed_object_meters
 
-                rx_world = rx_cam
-                ry_world = -ry_cam * np.cos(self.theta) + rz_cam * np.sin(self.theta)
-                rz_world =  ry_cam * np.sin(self.theta) + rz_cam * np.cos(self.theta)
+                rx_world = - rx_cam
+                ry_world =   ry_cam * np.cos(self.theta) - rz_cam * np.sin(self.theta)
+                rz_world =   ry_cam * np.sin(self.theta) + rz_cam * np.cos(self.theta)
+
                 current_world_pos = [rx_world, ry_world, rz_world]
 
                 if self.last_world_pos is not None and self.last_timestamp is not None:
@@ -642,6 +666,13 @@ class SpeedDetNode(Node):
                                     f"[PRED] X_landing: {x_at_landing:.2f}m | Y_landing: {y_at_landing:.2f}m | Impact in: {time_to_landing:.3f}s"
                                 )   
 
+                                msg_pred = LandingPrediction()
+                                msg_pred.t_landing = float(time_to_landing)
+                                msg_pred.x_landing = float(x_at_landing)
+                                msg_pred.y_landing = float(y_at_landing)
+                                
+                                self.pub_landing.publish(msg_pred)
+
                         time_tracked = current_timestamp - self.trajectory_start_time
 
                         if rz < self.landing_z_threshold and time_tracked >= self.min_time_before_landing_check:
@@ -704,6 +735,8 @@ class SpeedDetNode(Node):
                 if self.frame_count % 30 == 0: 
                     self.csv_file.flush()
 
+            display_image = cv2.flip(annotated_image, -1)
+
             if self.record_mode:
                 if self.video_writer is None:
                     self.record_path = os.path.join(self.video_folder,                   
@@ -713,13 +746,13 @@ class SpeedDetNode(Node):
                     self.get_logger().info(f"Recording started.")
                 
                 if self.video_writer is not None:
-                    self.video_writer.write(annotated_image)
+                    self.video_writer.write(display_image)
             
 
             self.frame_count += 1
 
             #cv2.putText(annotated_image, "Press ECHAP to quit", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            cv2.imshow("Throw Detection With Object Speed", annotated_image)
+            cv2.imshow("Throw Detection With Object Speed", display_image)
             key = cv2.waitKey(1) & 0xFF
 
             if key == 27:

@@ -1,25 +1,12 @@
-*.sh
+# Data files (videos and weights)
 *.avi
-cyclonedds_host.xml
 yolo26n.pt
 yolov8s-world.pt
 stgcn_lancer.pt
+books.pt
 *.pth
 
-build/
-captures_videos/
-distance_logs/
-install/
-log/
-Log/
-src/yolo_detectors/resource
-src/yolo_detectors/test
-src/yolo_detectors/config
-src/yolo_detectors/yolo_detectors/build
-src/yolo_detectors/yolo_detectors/install
-src/yolo_detectors/yolo_detectors/log
-data/
-
+# Node files
 test_subscriber_node.py
 yolo_world_node.py
 train_stgcn.py
@@ -29,3 +16,29 @@ double_detection_node.py
 mathematical_throw_detection_node.py
 test_subscriber_node.py
 lstm_node.py
+
+# Other files (env, ...)
+*.sh
+cyclonedds_host.xml
+*.db
+
+# Build directories
+build/
+install/
+log/
+**/build/
+**/install/
+**/log/
+
+# Packages directories
+src/yolo_detectors/resource
+src/yolo_detectors/test
+src/yolo_detectors/config
+src/g1_arm_control/resource
+src/g1_arm_control/test
+src/g1_arm_control/config
+
+# Other directories
+Log/
+data/
+.vscode/

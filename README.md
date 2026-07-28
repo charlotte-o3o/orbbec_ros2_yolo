@@ -208,8 +208,7 @@ ros2_orbbec_ws/
 ├── entrypoint.sh                 # Picks CYCLONEDDS_URI based on DEPLOYMENT_ENV
 ├── Makefile                      # make build / deploy / stop / logs / clean / attach / fix-daemon
 ├── .env.example                  # Copy to .env and fill in
-├── requirements.txt
-└── setup_env.sh                  # Optional, for running nodes on the host without Docker
+└── requirements.txt
 ```
 
 ## Requirements
@@ -224,10 +223,3 @@ Everything below is installed automatically inside the Docker image — you don'
 - An Orbbec camera publishing synchronized color/depth image topics (via the separate `orbbec_ros2` driver)
 
 All Python dependencies with their exact required versions are listed in [`requirements.txt`](./requirements.txt) and installed at image build time.
-
-If you want to run nodes directly on the host instead (e.g. for faster iteration without rebuilding), see `setup_env.sh` — you'll need to adapt the hardcoded paths to your own machine, and manually install:
-```bash
-sudo apt install ros-<distro>-cv-bridge
-sudo apt install ros-<distro>-message-filters
-pip install -r requirements.txt
-```

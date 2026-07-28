@@ -6,6 +6,10 @@ stgcn_lancer.pt
 books.pt
 *.pth
 
+# Python files
+__pycache__/
+*.pyc
+
 # Node files
 test_subscriber_node.py
 yolo_world_node.py
@@ -18,9 +22,10 @@ test_subscriber_node.py
 lstm_node.py
 
 # Other files (env, ...)
-*.sh
 cyclonedds_host.xml
 *.db
+.env
+setup_env.sh
 
 # Build directories
 build/
@@ -31,12 +36,8 @@ log/
 **/log/
 
 # Packages directories
-src/yolo_detectors/resource
 src/yolo_detectors/test
-src/yolo_detectors/config
-src/g1_arm_control/resource
 src/g1_arm_control/test
-src/g1_arm_control/config
 
 # Other directories
 Log/

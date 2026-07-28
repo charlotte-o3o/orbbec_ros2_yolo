@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS>
+    <Domain>
+        <General>
+            <NetworkInterfaceAddress>lo</NetworkInterfaceAddress>
+            <AllowMulticast>true</AllowMulticast>
+        </General>
+        <Discovery>
+            <ParticipantIndex>auto</ParticipantIndex>
+            <MaxAutoParticipantIndex>200</MaxAutoParticipantIndex>
+            <Peers>
+                <Peer address="localhost"/>
+            </Peers>
+        </Discovery>
+    </Domain>
+</CycloneDDS>

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS>
+    <Domain>
+        <General>
+            <!-- TODO: remplacer par la vraie interface réseau du robot (ex: eth0, wlan0)
+                 Vérifier avec `ip addr` sur la machine cible -->
+            <NetworkInterfaceAddress>TODO_INTERFACE</NetworkInterfaceAddress>
+            <AllowMulticast>true</AllowMulticast>
+        </General>
+        <Discovery>
+            <!-- TODO: remplacer les IPs par celels du réseau robot -->
+            <Peers>
+                <Peer address="176.16.0.1"/>
+                <Peer address="192.168.1.2"/>
+                <Peer address="192.168.1.1"/>
+                <Peer address="192.168.1.42"/>
+                <Peer address="127.0.0.1"/>
+            </Peers>
+            <ParticipantIndex>auto</ParticipantIndex>
+            <MaxAutoParticipantIndex>200</MaxAutoParticipantIndex>
+        </Discovery>
+    </Domain>
+</CycloneDDS>

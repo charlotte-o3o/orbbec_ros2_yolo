@@ -2,6 +2,8 @@
 
 ROS 2 nodes for running YOLO pose estimation, a fine-tuned YOLO object detector, and a speed-based throwing-action detector on synchronized color/depth streams from an Orbbec camera, with depth-based 3D distance estimation between detected objects and human wrist keypoints.
 
+This workspace is **dockerized**: everything runs inside a container built from the provided `Dockerfile`, launched via `docker compose` (wrapped in a `Makefile` for convenience). No local ROS 2 / Python environment setup is required to run it — only Docker.
+
 ## Nodes
 
 - **`yolo_pose_node`** — runs YOLO pose estimation on the color stream, overlays skeleton keypoints, and computes the distance to each detected person (from shoulder midpoint) using the synchronized depth image.
@@ -22,61 +24,90 @@ and synchronize them with an approximate time synchronizer.
 
 It also subscribes once to `/orbbec_external/color/camera_info` to retrieve the real camera intrinsics (fx, fy, cx, cy), then unsubscribes.
 
+`speed_det_node` also opens an OpenCV/Qt debug window for live annotated video — this requires X11 access from the container (see [Launching](#launching) below).
+
 ## Camera Driver
 
-The Orbbec camera is run through a dockerized ROS 2 wrapper, available here: [hucebot/orbbec_ros2](https://github.com/hucebot/orbbec_ros2). Credit to the [Hucebot](https://github.com/hucebot) team for this driver.
+The Orbbec camera is run through a **separate, dockerized** ROS 2 wrapper, available here: [hucebot/orbbec_ros2](https://github.com/hucebot/orbbec_ros2). Credit to the [Hucebot](https://github.com/hucebot) team for this driver.
 
-## Configuration
+This repo does **not** vendor or modify that driver — clone it independently, following its own README/Makefile. The only thing that must match between the two is `ROS_DOMAIN_ID` and `DEPLOYMENT_ENV` (see [Environment variables](#environment-variables) below), so both DDS domains agree and can discover each other.
 
-You will need **two open terminals**.
+## Prerequisites
 
-### Terminal 1 — `/orbbec_ros2`
+- Docker + Docker Compose
+- NVIDIA Container Toolkit (for GPU access — YOLO inference)
+- An X server on the host (for `speed_det_node`'s debug window) — standard on any Linux desktop
+- The camera driver ([hucebot/orbbec_ros2](https://github.com/hucebot/orbbec_ros2)) cloned and running separately
 
-1. (Optional) Export the environment variables listed in the table below.
-2. Deploy the camera driver:
+## Setup
+
+1. Clone this repo.
+2. Copy the environment template and fill in your values:
    ```bash
-   make deploy
+   cp .env.example .env
    ```
+   At minimum, check `ROS_DOMAIN_ID` and `DEPLOYMENT_ENV` match the `.env` used in your `orbbec_ros2` clone (see [Environment variables](#environment-variables)).
 
-### Terminal 2 — `/ros2_orbbec_ws`
+## Launching
 
-1. Source the ROS 2 environment:
-   ```bash
-   source /opt/ros/<ros-distro>/setup.bash
-   ```
-2. (Optional) Export the environment variables listed in the table below.
-3. Verify the topics are being published:
-   ```bash
-   ros2 topic list
-   ros2 topic hz <topic_name>
-   ros2 topic echo <topic_name>
-   ```
-4. Build the workspace:
-   ```bash
-   colcon build
-   ```
-5. Launch the desired node:
-   ```bash
-   ros2 run <package_name> yolo_pose_node
-   # or
-   ros2 run <package_name> fine_tune_yolo_node
-   # or
-   ros2 run <package_name> speed_det_node
-   ```
+You will need **two terminals** (or two clones running independently) — one for the camera driver, one for this vision pipeline.
 
-   > `speed_det_node` depends on `/yolo_detected_objects` and `/yolo_detected_poses`, so `fine_tune_yolo_node` and `yolo_pose_node` must also be running for it to receive synchronized data.
+### Terminal 1 — camera driver (`orbbec_ros2`)
+
+```bash
+cd /path/to/orbbec_ros2
+make deploy
+```
+
+### Terminal 2 — this repo
+
+```bash
+cd /path/to/ros2_orbbec_ws
+make build     # only needed the first time, or after changing Dockerfile/config/requirements.txt
+make deploy    # runs `xhost +local:docker` then starts the container
+```
+
+`make deploy` runs `xhost +local:docker` for you, since `speed_det_node` needs X11 access as soon as it starts (not just for optional debugging). If you're on a fresh session/reboot and see an X11/Qt error on launch, this should already be handled — if not, run `xhost +local:docker` manually once per session.
+
+### Useful Make targets
+
+| Command | What it does |
+|---|---|
+| `make build` | Build the Docker image. Required after changing `Dockerfile`, `requirements.txt`, or anything under `config/` (these are baked into the image, not volume-mounted). |
+| `make deploy` | `xhost +local:docker` + start the container (`--force-recreate`). |
+| `make logs` | Follow the container's logs. |
+| `make stop` | Stop the container. |
+| `make clean` | Stop + remove the container, and delete local `build/`, `install/`, `log/`, `Log/` (ROS 2/colcon artifacts). |
+| `make attach` | Open an interactive shell inside the running container. |
+| `make fix-daemon` | Kill a stale local `ros2-daemon` process, in case it's cached with the wrong `RMW_IMPLEMENTATION` and `ros2 topic list`/`ros2 node list` show nothing despite the container running fine. |
+
+> Editing files under `src/` or `weights/` does **not** require a rebuild — they're volume-mounted, so `make stop && make deploy` (or just restarting the container) picks up changes. If you change a compiled/C++ package, you'll still need to rebuild the ROS 2 workspace inside the container (`colcon build`), not the Docker image itself.
+
+### Verifying it's running
+
+From inside the container (`make attach`), or with the ROS 2 CLI on the host if you have it installed with matching `RMW_IMPLEMENTATION`/`CYCLONEDDS_URI`/`ROS_DOMAIN_ID`:
+```bash
+ros2 topic list
+ros2 topic hz /orbbec_external/color/image_raw
+```
+You should see the full set of `/orbbec_external/...` topics from the camera driver, plus `/yolo_detected_objects`, `/yolo_detected_poses` from this pipeline. If you only see `/parameter_events` and `/rosout`, try `make fix-daemon` first before assuming something is actually broken — this is very often a stale local daemon, not a real discovery issue.
 
 ### Environment variables
 
-| Variable | `~/orbbec_ros2` | `~/ros2_orbbec_ws` |
+Set in `.env` (copy from `.env.example`). Must match the corresponding `.env` in the `orbbec_ros2` clone for `ROS_DOMAIN_ID` and `DEPLOYMENT_ENV`:
+
+| Variable | Description | Must match `orbbec_ros2`? |
 |---|---|---|
-| `ROS_DOMAIN_ID` | `2` | `2` |
-| `CYCLONEDDS_URI` | `<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='lo'/></Interfaces><AllowMulticast>false</AllowMulticast></General></Domain></CycloneDDS>` | *null* |
-| `RMW_IMPLEMENTATION` | `rmw_cyclonedds_cpp` | *null* |
+| `ROS_DOMAIN_ID` | ROS 2 DDS domain ID | ✅ Yes |
+| `DEPLOYMENT_ENV` | `local` (single-machine dev) or `robot` (multi-machine deployment) — selects `config/cyclonedds_local.xml` or `config/cyclonedds_robot.xml` | ✅ Yes |
+
+`RMW_IMPLEMENTATION` (`rmw_cyclonedds_cpp`) and the CycloneDDS XML configs live in [`config/`](./config) and are set automatically by `entrypoint.sh` based on `DEPLOYMENT_ENV` — no need to export them manually.
 
 ### Troubleshooting
 
-If the topics stop being published, stop the Docker container, unplug the camera, then plug it back in and relaunch the Docker container.
+- **No topics visible / only `/parameter_events` and `/rosout`**: run `make fix-daemon`, then retry. This clears a stale `ros2-daemon` process that can get cached with the wrong `RMW_IMPLEMENTATION` and silently fail to see any CycloneDDS nodes.
+- **`speed_det_node` crashes with a Qt/xcb error**: X11 isn't authorized for the container. Run `xhost +local:docker` on the host, then `make deploy` again.
+- **Camera topics stop being published**: stop the camera driver container, unplug the camera, plug it back in, then relaunch the driver (`make stop && make deploy` in the `orbbec_ros2` terminal).
 
 ## Node parameters
 
@@ -151,6 +182,9 @@ At the end of each tracked throw (or on node shutdown while a throw is active), 
 
 ```
 ros2_orbbec_ws/
+├── config/
+│   ├── cyclonedds_local.xml      # DEPLOYMENT_ENV=local
+│   └── cyclonedds_robot.xml      # DEPLOYMENT_ENV=robot
 ├── src/
 │   ├── lancer_interfaces/        # Custom ROS 2 message definitions
 │   │   ├── msg/
@@ -169,25 +203,31 @@ ros2_orbbec_ws/
 ├── weights/                      # Model weights
 │   ├── yolo26n-pose.pt
 │   └── alien_plushie_v5.pt
+├── Dockerfile
+├── docker-compose.yml
+├── entrypoint.sh                 # Picks CYCLONEDDS_URI based on DEPLOYMENT_ENV
+├── Makefile                      # make build / deploy / stop / logs / clean / attach / fix-daemon
+├── .env.example                  # Copy to .env and fill in
 ├── requirements.txt
-└── setup_env.sh
+└── setup_env.sh                  # Optional, for running nodes on the host without Docker
 ```
 
 ## Requirements
 
+Everything below is installed automatically inside the Docker image — you don't need any of this on your host to run the pipeline via `make deploy`.
+
 - ROS 2
 - `cv_bridge`, `message_filters`
-```bash
-sudo apt install ros-<distro>-cv-bridge
-sudo apt install ros-<distro>-message-filters
-```
 - OpenCV (`opencv-python`)
 - `ultralytics` (YOLO)
 - `matplotlib` (trajectory plotting)
-- An Orbbec camera publishing synchronized color/depth image topics
+- An Orbbec camera publishing synchronized color/depth image topics (via the separate `orbbec_ros2` driver)
 
-All Python dependencies with their exact required versions are listed in [`requirements.txt`](./requirements.txt). Install them with:
+All Python dependencies with their exact required versions are listed in [`requirements.txt`](./requirements.txt) and installed at image build time.
 
+If you want to run nodes directly on the host instead (e.g. for faster iteration without rebuilding), see `setup_env.sh` — you'll need to adapt the hardcoded paths to your own machine, and manually install:
 ```bash
+sudo apt install ros-<distro>-cv-bridge
+sudo apt install ros-<distro>-message-filters
 pip install -r requirements.txt
 ```

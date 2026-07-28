@@ -1,0 +1,38 @@
+services:
+  vision_pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ros2_orbbec_vision:latest
+    container_name: ros2_vision_container
+
+    # Partage le réseau de l'hôte pour la communication ROS 2
+    network_mode: host
+
+    # ROS_DOMAIN_ID doit correspondre à celui du wrapper caméra (orbbec_ros2, voir son .env)
+    # RMW_IMPLEMENTATION doit aussi matcher : le wrapper force rmw_cyclonedds_cpp (stage "dep")
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-2}
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - DEPLOYMENT_ENV=${DEPLOYMENT_ENV:-local}
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+
+    # Accès à la carte graphique NVIDIA (PyTorch / YOLO)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Monte le code source pour itérer sans tout reconstruire
+    volumes:
+      - ./src:/ros2_orbbec_ws/src
+      - ./weights:/ros2_orbbec_ws/weights
+      - /tmp/.docker.xauth:/tmp/.docker.xauth:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix
+
+    # Commande par défaut au lancement
+    command: ros2 launch yolo_detectors throw_det.launch.py

@@ -21,11 +21,12 @@ mathematical_throw_detection_node.py
 test_subscriber_node.py
 lstm_node.py
 
-# Other files (env, ...)
+# Other files (ide, env, ...)
 cyclonedds_host.xml
 *.db
 .env
 setup_env.sh
+.vscode/
 
 # Build directories
 build/

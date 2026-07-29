@@ -1,7 +1,6 @@
 import os
 import warnings
 
-
 warnings.filterwarnings("ignore", category=UserWarning, message="Unable to import Axes3D")
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;*.warning=false"
 
@@ -29,10 +28,6 @@ class SpeedDetNode(Node):
 
         self.get_logger().info("*** Speed Based Throw Detection Node Launched ***")
 
-        self.save_distance_mode = False
-        self.record_mode = False
-        self.annotations_mode = True
-
         self.bridge = CvBridge()
 
         self.box_color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))   
@@ -40,7 +35,7 @@ class SpeedDetNode(Node):
         self.left_wrist_color = (218, 110, 255)
 
         ######################################################################
-        #         CAMERA PARAMETERS (to be updated from CameraInfo)          #
+        #          CAMERA PARAMETERS (to be updated from CameraInfo)         #
         ######################################################################
 
         self.fps_camera = 30.0
@@ -48,7 +43,7 @@ class SpeedDetNode(Node):
         self.fy = 616.0  # Focal length in pixels (y-axis)
         self.cx = 320.0  # Principal point x-coordinate (image center)      
         self.cy = 240.0  # Principal point y-coordinate (image center)
-        self.has_camera_info = False  # Flag to check if camera info has been received
+        self.has_camera_info = False
 
         self.frame_count = 1
 
@@ -56,7 +51,7 @@ class SpeedDetNode(Node):
         self.timestamp_csv = time.strftime("%Y-%m-%d_%H-%M-%S")
 
         ######################################################################
-        #                                                                    #
+        #                        DATA LOGGING SETUP                          #
         ######################################################################
         
         if self.save_distance_mode:
@@ -90,65 +85,107 @@ class SpeedDetNode(Node):
             self.get_logger().info("Record mode OFF.")
 
         ######################################################################
-        #                                                                    #
+        #                      CONFIGURABLE PARAMETERS                       #
         ######################################################################
-        
-        self.throw_detected = False
-        self.previous_throw_detected = False
-        self.throw_coordinates = None
-        self.previous_object_center_meters = None
-        self.previous_object_timestamp = None
 
-        self.smoothed_object_meters = None
-        self.alpha_smooth = 0.4       
-        self.last_object_meters = None
-        self.last_world_pos = None
-        self.last_timestamp = None
+        # Operating modes (Toggles / Flags)
+        self.save_distance_mode = self.declare_parameter('save_distance_mode', False).value
+        self.record_mode = self.declare_parameter('record_mode', False).value
+        self.annotations_mode = self.declare_parameter('annotations_mode', True).value
 
-        self.cooldown_duration = 8.0   
-        self.last_throw_trigger_time = 0.0 
-        
-        self.false_frame_counter = 0      
-        self.max_false_frames_allowed = 10
+        self.alpha_smooth = self.declare_parameter('alpha_smooth', 0.4).value
+        self.cooldown_duration = self.declare_parameter(
+            'cooldown_duration', 8.0
+        ).value
+        self.max_false_frames_allowed = self.declare_parameter(
+            'max_false_frames_allowed', 10
+        ).value
+        self.trajectory_tracking_duration = self.declare_parameter(
+            'trajectory_tracking_duration', 3.0
+        ).value
+        self.history_sampling_interval = self.declare_parameter(
+            'history_sampling_interval', 0.10
+        ).value
+        self.speed_threshold = self.declare_parameter(
+            'speed_threshold', 2.0
+        ).value
+        self.startup_grace_period = self.declare_parameter( # s, aucun lancer ne peut etre detecte avant ce delai apres le lancement du node
+            'startup_grace_period', 8.0
+        ).value
+        self.throw_confirm_frames = self.declare_parameter( # L'objet doit être rapide pendant au moins 3 frames consécutives
+            'throw_confirm_frames', 3
+        ).value
 
-        self.trajectory_tracking_active = False
-        self.predicted_trajectory = None          # Derniere prediction "vivante" (une seule courbe, ecrasee a chaque frame)
-        self.trajectory_start_time = None
-        self.trajectory_start_frame = None         # numero de frame du premier point du lancer (pour retrouver le lancer dans la video)
-        self.trajectory_tracking_duration = 5.0
-        self.trajectory_observed = []              # Points REELLEMENT mesures depuis le debut du lancer (t, x, y, z)
-        self.trajectory_history = []                # Predictions echantillonnees (pour visualiser l'evolution, pas toutes les frames)
-        self.history_sampling_interval = 0.10        # secondes entre deux predictions archivees (independant du fps)
-        self.last_history_sample_time = None
+        # Physical safeguards
+        self.min_valid_z = self.declare_parameter('min_valid_z', 0.1).value
+        self.max_valid_z = self.declare_parameter('max_valid_z', 10.0).value
+        self.max_valid_xy = self.declare_parameter('max_valid_xy', 5.0).value
+        self.min_valid_dt = self.declare_parameter('min_valid_dt', 0.01).value # s, en dessous : bruit temporel -> vitesse qui explose
+        self.max_valid_speed = self.declare_parameter(
+            'max_valid_speed', 25.0
+        ).value
 
-        self.speed_threshold = 2.0
-        self.startup_grace_period = 8.0  # s, aucun lancer ne peut etre detecte avant ce delai apres le lancement du node
-        self.throw_confirm_frames = 3      # L'objet doit être rapide pendant au moins 3 frames consécutives
-        self.throw_confirm_counter = 0
+        # Landing detection
+        self.landing_z_threshold = self.declare_parameter(
+            'landing_z_threshold', 0.1
+        ).value
+        self.min_time_before_landing_check = self.declare_parameter( # s, temps minimum de suivi avant d'autoriser la detection d'atterrissage
+            'min_time_before_landing_check', 0.15
+        ).value
+        self.landing_confirm_frames = self.declare_parameter(
+            'landing_confirm_frames', 3
+        ).value
 
-        # --- Garde-fous physiques : toute position/mise a jour hors de ces bornes est rejetee ---
-        self.min_valid_z = 0.1        # m, en dessous : profondeur invalide/trop proche
-        self.max_valid_z = 10.0        # m, au-dela : profondeur aberrante
-        self.max_valid_xy = 5.0        # m, deplacement lateral/vertical plausible dans la piece
-        self.min_valid_dt = 0.01       # s, en dessous : bruit temporel -> vitesse qui explose
-        self.max_valid_speed = 25.0    # m/s, au-dela : vitesse non physique pour un lancer a la main
+        # Bornes verticales & Caméra
+        self.max_predicted_height = self.declare_parameter(
+            'max_predicted_height', 2.0
+        ).value
+        self.max_predicted_fall = self.declare_parameter(
+            'max_predicted_fall', -2.0
+        ).value
+        self.camera_tilt_deg = self.declare_parameter(
+            'camera_tilt_deg', 0.0
+        ).value
 
-        # --- Debounce pour la detection d'atterrissage : evite un arret sur la 1ere frame ---
-        self.landing_z_threshold = 0.1                  # m, objet considere "arrive" quand il est a moins de 10cm de la camera
-        self.min_time_before_landing_check = 0.15       # s, temps minimum de suivi avant d'autoriser la detection d'atterrissage
-        self.landing_confirm_frames = 3                 # nb de frames consecutives sous le seuil pour confirmer
-        self.landing_confirm_counter = 0
-
-        # --- Bornes physiques verticales (repere: Y positif = vers le bas, Y negatif = vers le haut) ---
-        # A adapter a ta piece/setup si besoin.
-        self.max_predicted_height = 2.0   # m, Y ne doit jamais monter en dessous de ca (2m au-dessus de l'origine camera)
-        self.max_predicted_fall = -2.0      # m, Y ne doit jamais depasser ca vers le bas (sol/limite basse plausible)
-
-        self.camera_tilt_deg = 45.0  # Ajuste l'angle réel de ton trépied ici
+        # Derivated variable
         self.theta = np.radians(self.camera_tilt_deg)
 
         ######################################################################
-        #                                                                    #
+        #                   INTERNAL TRACKING STATUSES                       #
+        ######################################################################
+
+        # Flags and events
+        self.throw_detected = False
+        self.previous_throw_detected = False
+        self.trajectory_tracking_active = False
+
+        # Coordinates, measurements, and geometry
+        self.throw_coordinates = None
+        self.previous_object_center_meters = None
+        self.smoothed_object_meters = None
+        self.last_object_meters = None
+        self.last_world_pos = None
+
+        # Timestamps and timers
+        self.previous_object_timestamp = None
+        self.last_timestamp = None
+        self.last_throw_trigger_time = 0.0
+        self.trajectory_start_time = None
+        self.trajectory_start_frame = None
+        self.last_history_sample_time = None
+
+        # Frame counters
+        self.false_frame_counter = 0
+        self.throw_confirm_counter = 0
+        self.landing_confirm_counter = 0
+
+        # Histories and trajectories
+        self.predicted_trajectory = None
+        self.trajectory_observed = []
+        self.trajectory_history = []
+        
+        ######################################################################
+        #                           PUBLISHERS                               #
         ######################################################################
 
         self.pub_landing = self.create_publisher(
@@ -156,6 +193,10 @@ class SpeedDetNode(Node):
             '/trajectory/landing_prediction',
             10
         )
+
+        ######################################################################
+        #                           SUBSCRIBERS                              #
+        ######################################################################
 
         self.sub_info = self.create_subscription(
             CameraInfo,
@@ -188,6 +229,10 @@ class SpeedDetNode(Node):
             '/yolo_detected_poses'
         )
 
+        ######################################################################
+        #                          SYNCHRONIZER                              #
+        ######################################################################
+
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [self.sub_image, self.sub_depth, self.sub_fine_tune_yolo, self.sub_yolo_pose],
             queue_size=10,
@@ -199,10 +244,10 @@ class SpeedDetNode(Node):
     def camera_info_callback(self, msg: CameraInfo):
 
         if not self.has_camera_info:
-            self.fx = msg.k[0]  # Focal length in pixels (x-axis)
-            self.fy = msg.k[4]  # Focal length in pixels (y-axis)
-            self.cx = msg.k[2]  # Principal point x-coordinate (image center)      
-            self.cy = msg.k[5]  # Principal point y-coordinate (image center)
+            self.fx = msg.k[0]
+            self.fy = msg.k[4] 
+            self.cx = msg.k[2]     
+            self.cy = msg.k[5] 
             self.has_camera_info = True
 
             self.get_logger().info(f"Camera info received: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
@@ -211,11 +256,8 @@ class SpeedDetNode(Node):
 
     def is_valid_object_position(self, position_meters):
         """
-        Verifie que la position 3D (x, y, z) en metres est physiquement plausible
-        avant de l'utiliser pour ancrer une trajectoire. C'est ce garde-fou qui
-        manquait et qui laissait passer des positions aberrantes (ex: Y=0 par
-        defaut ou Y=-120 issu d'une profondeur corrompue) directement dans les
-        predictions.
+        Checks that the 3D position (x, y, z) in meters is physically 
+        plausible before using it to anchor a trajectory.
         """
         if position_meters is None or None in position_meters:
             return False
@@ -233,20 +275,24 @@ class SpeedDetNode(Node):
             return False
 
         return True
+
+    ######################################################################
+    #                        TRAJECTORY PREDICTION                       #
+    ######################################################################
     
     def predict_smoothed_trajectory(self, t_since_start, dt_frame, g_const=9.81):
         """
-        Calcule la trajectoire future prédictive lissée par moindres carrés (polyfit)
-        à partir de la liste des points observés historiques.
-        
-        Retourne :
-            - raw_trajectory (list ou None) : points futurs prédits [(t, x, y, z), ...]
-            - vx_moy (float) : vitesse moyenne estimée sur X
-            - vz_moy (float) : vitesse moyenne estimée sur Z
-            - x_at_landing (float ou None) : Position X estimée au plan Z = 0.0m
-            - y_at_landing (float ou None) : Hauteur Y estimée au plan Z = 0.0m
-            - time_to_landing (float ou None) : Temps restant (en s) avant d'atteindre la caméra (Z = 0.0m)
-            """
+        Computes the smoothed predictive future trajectory using least squares polynomial fitting (polyfit)
+        from the list of historical observed points.
+
+        Returns:
+            - raw_trajectory (list or None): Predicted future points [(t, x, y, z), ...]
+            - vx_moy (float): Estimated average velocity along X
+            - vz_moy (float): Estimated average velocity along Z
+            - x_at_landing (float or None): Estimated X position at the landing plane Z = 0.0m
+            - y_at_landing (float or None): Estimated Y height at the landing plane Z = 0.0m
+            - time_to_landing (float or None): Remaining time (in s) before reaching the camera (Z = 0.0m)
+        """
         if len(self.trajectory_observed) < 3:
             return None, 0.0, 0.0, 0.0, 0.0, 0.0
 
@@ -255,60 +301,61 @@ class SpeedDetNode(Node):
         ys = np.array([p[2] for p in self.trajectory_observed])
         zs = np.array([p[3] for p in self.trajectory_observed])
 
-        # Régression linéaire (degré 1) pour X et Z (vitesse constante uniforme)
+        # Linear regression (degree 1) for X and Z (uniform constant velocity)
         poly_x = np.polyfit(ts, xs, 1) 
         poly_z = np.polyfit(ts, zs, 1)
 
         vx_moy = poly_x[0]
         vz_moy = poly_z[0]
 
-        # Si le vecteur Z global pointe dans le mauvais sens, prédiction invalide
+        # If the global Z vector points in the wrong direction, the prediction is invalid
         if vz_moy >= -0.05:
             return None, vx_moy, vz_moy, 0.0, 0.0, 0.0
 
-        # Ajustement gravitationnel de Y (repère Y positif vers le haut)
+        # Gravitational adjustment of Y (Y-axis positive upwards)
         ys_adjusted = ys + 0.5 * g_const * (ts ** 2)
         poly_y = np.polyfit(ts, ys_adjusted, 1)
 
-        # ==========================================
-        #    CALCUL ANALYTIQUE DE L'ATTERRISSAGE (REPÈRE WORLD)
-        # ==========================================
+        ######################################################################
+        #               ANALYTICAL CALCULATION OF THE LANDING                #
+        #                     (WORLD REFERENCE FRAME)                        #
+        ######################################################################
         # Z_world(t) = poly_z[0] * t + poly_z[1]
-        # On cherche t_landing tel que Z_world(t_landing) = 0.0
+        # We are looking for t_landing such that Z_world(t_landing) = 0.0
         target_z_world = 0.0
         t_landing = (target_z_world - poly_z[1]) / vz_moy
         
-        # Le temps restant avant de franchir la ligne Z_world = 0
+        # The remaining time before crossing the Z_world = 0 line
         time_to_landing = t_landing - t_since_start
         
-        # Calcul de la hauteur Y_world exacte à cet instant précis
+        # Calculation of the exact Y_world height at this precise moment
         x_at_landing = poly_x[0] * t_landing + poly_x[1]
         y_at_landing = -0.5 * g_const * (t_landing ** 2) + poly_y[0] * t_landing + poly_y[1]
         # ==========================================
 
         raw_trajectory = []
         t_future = t_since_start
-        max_time = t_since_start + 2.0  # Prédiction jusqu'à 2 secondes dans le futur
+        max_time = t_since_start + 2.0  # Prediction up to 2 seconds in the future
 
         while t_future <= max_time:
             x_pred = poly_x[0] * t_future + poly_x[1]
             y_pred = -0.5 * g_const * (t_future ** 2) + poly_y[0] * t_future + poly_y[1]
             z_pred = poly_z[0] * t_future + poly_z[1]
 
-            # Arrêt si la courbe sort des limites verticales physiques
+            # Stop if the curve exits the physical vertical limits.
             if y_pred > self.max_predicted_height or y_pred < self.max_predicted_fall:
                 raw_trajectory.append((t_future, x_pred, y_pred, z_pred))
                 break
 
             raw_trajectory.append((t_future, x_pred, y_pred, z_pred))
 
-            # Arrêt si l'objet atteint virtuellement l'objectif caméra
+            # Stop if the object virtually reaches the camera target
             if z_pred <= self.landing_z_threshold and t_future > 0:
                 break
 
             t_future += dt_frame
 
-        # Vérification du Cliff Effect (collision prématurée du sol au loin)
+        # Verification of the Cliff Effect (premature collision with the ground)
         if raw_trajectory:
             last_point = raw_trajectory[-1]
             last_y = last_point[2]
@@ -335,8 +382,7 @@ class SpeedDetNode(Node):
 
         frame_label = f"frame {self.trajectory_start_frame}" if self.trajectory_start_frame is not None else "frame ?"
 
-        # 1) Trajectoire REELLEMENT observee depuis le premier point du lancer
-        #    -> une seule courbe continue, c'est la "verite terrain"
+        # Ground truth observed trajectory
         if self.trajectory_observed:
             xs_obs = [point[1] for point in self.trajectory_observed]
             ys_obs = [point[2] for point in self.trajectory_observed]
@@ -346,8 +392,7 @@ class SpeedDetNode(Node):
             ax2.plot(zs_obs, xs_obs, color='black',
                      marker='o', markersize=3, label="Observed points", zorder=5)
 
-        # 2) Predictions echantillonnees (une toutes les N frames, pas toutes)
-        #    -> montre l'evolution de la prediction sans que tout se superpose
+        # Sampled predictions
         for i, traj in enumerate(self.trajectory_history):
             xs = [point[1] for point in traj]
             ys = [point[2] for point in traj]
@@ -357,7 +402,7 @@ class SpeedDetNode(Node):
             ax2.plot(zs, xs, alpha=0.35, linestyle='--', color='tab:blue',
                       label="Predictions" if i == 0 else None)
 
-        # 3) Derniere prediction "vivante" mise en avant
+        # Last prediction
         if self.predicted_trajectory:
             xs_last = [point[1] for point in self.predicted_trajectory]
             ys_last = [point[2] for point in self.predicted_trajectory]
@@ -420,6 +465,11 @@ class SpeedDetNode(Node):
             rw_pixels = None
             object_center_meters = None
             rx, ry, rz = None, None, None
+
+            ######################################################################
+            #                          PROCESSING OF                             #
+            #                   YOLO DETECTIONS AND POSES                        #
+            ######################################################################           
 
             for detection in yolo_objects.detections:
                 x_center = detection.bbox.center.position.x
@@ -495,6 +545,10 @@ class SpeedDetNode(Node):
                     for pt1, pt2 in hold_connections:
                         cv2.line(annotated_image, pt1, pt2, (0, 255, 255), 2)
 
+            ######################################################################
+            #                         THROW DETECTION                            #
+            ######################################################################
+
             current_timestamp = time.time() - self.start_time
             object_speed_csv = 0.0
             remaining_time = self.startup_grace_period - current_timestamp
@@ -512,12 +566,15 @@ class SpeedDetNode(Node):
                 if self.smoothed_object_meters is None:
                     self.smoothed_object_meters = list(object_center_meters)
                 else:
+                    # Smoothing the 3D position of the object to reduce noise and jitter in speed calculations
                     self.smoothed_object_meters[0] = self.alpha_smooth * object_center_meters[0] + (1 - self.alpha_smooth) * self.smoothed_object_meters[0]
                     self.smoothed_object_meters[1] = self.alpha_smooth * object_center_meters[1] + (1 - self.alpha_smooth) * self.smoothed_object_meters[1]
                     self.smoothed_object_meters[2] = self.alpha_smooth * object_center_meters[2] + (1 - self.alpha_smooth) * self.smoothed_object_meters[2]
 
                 rx_cam, ry_cam, rz_cam = self.smoothed_object_meters
 
+                # Transformation from camera coordinates to world coordinates 
+                # (assuming camera is tilted by theta around the X-axis)
                 rx_world = - rx_cam
                 ry_world =   ry_cam * np.cos(self.theta) - rz_cam * np.sin(self.theta)
                 rz_world =   ry_cam * np.sin(self.theta) + rz_cam * np.cos(self.theta)
@@ -527,10 +584,12 @@ class SpeedDetNode(Node):
                 if self.last_world_pos is not None and self.last_timestamp is not None:
                     dt = current_timestamp - self.last_timestamp
                     if dt >= self.min_valid_dt:
+                        # Compute the velocity components in the world frame
                         vrx = (current_world_pos[0] - self.last_world_pos[0]) / dt
                         vry = (current_world_pos[1] - self.last_world_pos[1]) / dt
                         vrz = (current_world_pos[2] - self.last_world_pos[2]) / dt
 
+                        # Compute the overall speed of the object in meters per second
                         object_speed_m_s = (vrx**2 + vry**2 + vrz**2)**0.5 
 
                         if self.annotations_mode:
@@ -546,20 +605,26 @@ class SpeedDetNode(Node):
 
                 if remaining_time <= 0:
                     if object_speed_m_s >= self.speed_threshold and vrz < 0:
+                        # The object is moving fast enough and is getting closer to the
+                        # camera, which may indicate a throw
                         self.throw_confirm_counter += 1
 
                         if self.throw_confirm_counter >= self.throw_confirm_frames:
+                            # The object has been moving fast enough for enough 
+                            # consecutive frames to confirm a throw
                             self.false_frame_counter = 0
                             self.throw_detected = True
 
                             if self.annotations_mode:
                                         cv2.putText(annotated_image, f"THROW", (30, 50),                                        
                                             cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-                            
-                    else:   # if remaining_time <= 0 but not (object_speed_m_s >= self.speed_threshold and vrz < 0):
+                    # if remaining_time <= 0 but not (object_speed_m_s >= self.speed_threshold and vrz < 0):        
+                    else:   
                         self.throw_confirm_counter = 0
                         self.false_frame_counter += 1                    
                         if self.false_frame_counter >= self.max_false_frames_allowed:
+                            # The object has been moving too slowly or getting farther from the camera
+                            # for too many consecutive frames, so we reset the throw detection
                             self.throw_detected = False
 
                 if self.throw_detected is True and self.previous_throw_detected is not True and not self.trajectory_tracking_active:
@@ -576,11 +641,16 @@ class SpeedDetNode(Node):
                                 cv2.putText(annotated_image, coord_text, (30, h_color - 50),                                            
                                         cv2.FONT_HERSHEY_SIMPLEX, 1, self.box_color, 2)
 
+                            # Start trajectory tracking
                             self.trajectory_tracking_active = True
                             self.trajectory_start_time = current_timestamp
                             self.trajectory_start_frame = self.frame_count 
-                            self.trajectory_observed = [(0.0,) + tuple(self.throw_coordinates)] # pour inclure le premier point observé dans la trajectoire
-                            #self.trajectory_observed = []  # on ancre sur le 2eme point du lancer car le premier point utilise les données brutes potentiellement bruitées
+                            # Uncomment the following line to include the first observed point in the trajectory
+                            self.trajectory_observed = [(0.0,) + tuple(self.throw_coordinates)] 
+                            # Uncomment the following line to not include the first observed point in the trajectory
+                            # (we could want to anchor to the second point of the throw as the first point uses 
+                            # raw data that is potentially noisy)
+                            #self.trajectory_observed = []  
                             self.trajectory_history = []
                             self.predicted_trajectory = None
                             self.last_history_sample_time = None
@@ -590,46 +660,59 @@ class SpeedDetNode(Node):
                             self.get_logger().info(f"Throw started (vrz = {vrz:.3f}m/s): trajectory prediction start !\n")
                         
                         else:
+                            # The object is moving fast enough but its position is not 
+                            # physically plausible (e.g., Z < 0.1m or Z > 10m)
                             self.throw_coordinates = None
                             self.get_logger().warn("Throw detected but the object is invisible or its position is not physically plausible (rejected).")
                                 
                     else:
+                        # The object is moving fast enough but the cooldown period has not yet elapsed
                         self.get_logger().info(f"Flickering detected ! New initial point blocked by cooldown ({self.cooldown_duration - time_since_last_throw:.1f}s left)")
 
                 elif self.throw_detected is not True and self.previous_throw_detected is True:
+                    # The throw has ended, so we reset the throw coordinates and log the event
                     self.get_logger().info("\nThrow ended.")
                     self.throw_coordinates = None
 
                 self.previous_throw_detected = self.throw_detected
 
             if self.trajectory_tracking_active:
+                # The trajectory tracking is active, so we update the trajectory with the new observed point
                 stop_reason = None
 
                 if not self.throw_detected:
+                    # The object is no longer detected as being thrown, so we stop the trajectory tracking
                     stop_reason = "Trajectory tracking stopped: object lost or throw ended."
 
+                # Check if the object position is valid and if we have a previous position to compute speed
                 elif (self.is_valid_object_position(object_center_meters)
                       and self.previous_object_center_meters is not None
                       and self.previous_object_timestamp is not None):   
                     
                     if object_speed_m_s > self.max_valid_speed:
+                        # The object speed is too high to be physically plausible
                         self.get_logger().warn(
                             f"Trajectory update rejected: object speed too high = {object_speed_m_s:.1f} m/s."
                         )
 
                     elif vrz > 0:
+                       # The object is moving away from the camera (positive Z velocity)
                        self.get_logger().warn(f"Trajectory update rejected: vz positive = {vrz:.3f} m/s")
 
                     elif object_speed_m_s >= self.speed_threshold and vrz < -0.05:
+                        # Calculate elapsed time since the throw trajectory started
                         t_since_start = current_timestamp - self.trajectory_start_time
 
                         if self.trajectory_observed:
                             last_recorded_t = self.trajectory_observed[-1][0]
                             time_gap = t_since_start - last_recorded_t
-                            if time_gap > 0.50:  # Plus de 500ms de silence (environ 15 frames perdues)
+                            # Detect temporary tracking loss ("black hole") if no 
+                            # observations were recorded for over 500ms
+                            if time_gap > 0.50:  
                                 stop_reason = f"Trajectory tracking aborted: black hole detected ({time_gap:.2f}s without valid updates)."
                                 self.trajectory_tracking_active = False
 
+                        # Store the current valid 3D point in world coordinates
                         if stop_reason is None:
                             self.trajectory_observed.append((
                                 t_since_start, 
@@ -638,11 +721,15 @@ class SpeedDetNode(Node):
                                 rz_world
                             ))
 
+                        # Re-calculate predictive trajectory every 2 frames 
+                        # once at least 4 points have been collected
                         if len(self.trajectory_observed) >= 4 and len(self.trajectory_observed) % 2 == 0:
                             dt_frame = dt if dt is not None else (1.0 / self.fps_camera)
                             raw_trajectory, vx_moy, vz_moy, x_at_landing, y_at_landing, time_to_landing = self.predict_smoothed_trajectory(t_since_start, dt_frame)
 
                             if raw_trajectory is None:
+                                # If prediction fails due to non-approaching velocity, 
+                                # discard the last anomalous point
                                 if vz_moy >= -0.05:
                                     self.get_logger().warn(
                                         f"Trajectory prediction rejected (global Vz positive or flat): "
@@ -653,6 +740,7 @@ class SpeedDetNode(Node):
                             else:
                                 self.predicted_trajectory = raw_trajectory
 
+                                # Archive trajectory predictions periodically based on history sampling interval
                                 if (self.last_history_sample_time is None
                                         or (current_timestamp - self.last_history_sample_time) >= self.history_sampling_interval):
                                     self.trajectory_history.append(self.predicted_trajectory)
@@ -666,6 +754,7 @@ class SpeedDetNode(Node):
                                     f"[PRED] X_landing: {x_at_landing:.2f}m | Y_landing: {y_at_landing:.2f}m | Impact in: {time_to_landing:.3f}s"
                                 )   
 
+                                # Publish predicted landing details to ROS 2 topic
                                 msg_pred = LandingPrediction()
                                 msg_pred.t_landing = float(time_to_landing)
                                 msg_pred.x_landing = float(x_at_landing)
@@ -675,30 +764,38 @@ class SpeedDetNode(Node):
 
                         time_tracked = current_timestamp - self.trajectory_start_time
 
+                        # Check if object has arrived close enough to camera 
+                        # (landing threshold) after minimum allowed tracking time
                         if rz < self.landing_z_threshold and time_tracked >= self.min_time_before_landing_check:
                             self.landing_confirm_counter += 1
                         else:
                             self.landing_confirm_counter = 0
 
+                        # Stop tracking when landing is confirmed over N consecutive frames
                         if self.landing_confirm_counter >= self.landing_confirm_frames:
                             stop_reason = f"Object has reached the camera (Z={rz:.3f}m < {self.landing_z_threshold}m, confirmed)."
                     
                     else:
+                        # Reject trajectory update if approach speed towards the camera is too small
                         self.get_logger().warn("Cannot update trajectory : vz too small")
 
+                # Check if object tracking was lost due to too many consecutive undetected frames
                 if stop_reason is None and self.false_frame_counter >= self.max_false_frames_allowed:
                     stop_reason = "Trajectory tracking aborted: object stopped moving or lost."
 
+                # Check if trajectory tracking exceeded maximum allowed duration
                 elapsed = current_timestamp - self.trajectory_start_time
                 if stop_reason is None and elapsed >= self.trajectory_tracking_duration:
                     stop_reason = f"Trajectory tracking stopped after timeout ({elapsed:.2f}s)."
 
+                # Finalize tracking session and save trajectory plots if any stop condition was met
                 if stop_reason is not None:
                     self.trajectory_tracking_active = False
                     print()
                     self.get_logger().info(stop_reason)
                     self.plot_trajectory_history()
 
+            # Cache current valid position and timestamp for speed calculations in next frame
             if self.is_valid_object_position(object_center_meters):
                 self.previous_object_center_meters = object_center_meters
                 self.previous_object_timestamp = current_timestamp
@@ -726,7 +823,8 @@ class SpeedDetNode(Node):
                     
                     cv2.putText(annotated_image, text_cooldown, (pos_x, pos_y), 
                                 font, font_scale, color_orange, thickness)
-                    
+
+            # Write 3D trajectory and tracking status to CSV file if distance logging mode is enabled
             if self.save_distance_mode:        
                 x_csv = round(rx_world, 4) if rx is not None else ""
                 y_csv = round(ry_world, 4) if ry is not None else ""
@@ -735,8 +833,10 @@ class SpeedDetNode(Node):
                 if self.frame_count % 30 == 0: 
                     self.csv_file.flush()
 
-            display_image = cv2.flip(annotated_image, -1)
+            # Uncomment the following line if the camera is flipped upside down
+            #display_image = cv2.flip(annotated_image, -1)
 
+            # Record annotated video frames if recording mode is enabled
             if self.record_mode:
                 if self.video_writer is None:
                     self.record_path = os.path.join(self.video_folder,                   
@@ -746,15 +846,21 @@ class SpeedDetNode(Node):
                     self.get_logger().info(f"Recording started.")
                 
                 if self.video_writer is not None:
-                    self.video_writer.write(display_image)
+                    self.video_writer.write(annotated_image)
+                    # Uncomment the following line if the camera is flipped upside down
+                    #self.video_writer.write(display_image)
             
 
             self.frame_count += 1
 
             #cv2.putText(annotated_image, "Press ECHAP to quit", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            cv2.imshow("Throw Detection With Object Speed", display_image)
+            cv2.imshow("Throw Detection With Object Speed", annotated_image)
+            # Uncomment the following line if the camera is flipped upside down
+            #cv2.imshow("Throw Detection With Object Speed", display_image)
+            
             key = cv2.waitKey(1) & 0xFF
 
+            # Exit execution if ESC key (ASCII 27) is pressed
             if key == 27:
                 print("\n\n-----")
                 self.get_logger().info("ECHAP pressed. Shutting down the node...")
@@ -767,7 +873,10 @@ class SpeedDetNode(Node):
             self.get_logger().info(f"Error in the synchronized callback : {e}")
 
     def destroy_node(self):
-            
+            """
+            Safely cleanup resources, flush log files, release video writers, 
+            and save partial plot figures when shutting down the node.
+            """
             if getattr(self, 'trajectory_tracking_active', False) and self.trajectory_observed:           
                 self.get_logger().info("\nNode shutting down with an active throw: saving partial trajectory plot...")
                 self.trajectory_tracking_active = False

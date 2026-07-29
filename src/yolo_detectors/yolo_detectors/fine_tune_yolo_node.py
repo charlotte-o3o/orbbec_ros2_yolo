@@ -23,15 +23,16 @@ class FineTuneYoloNode(Node):
         super().__init__('fine_tune_yolo_node')
 
         self.declare_parameter('model_path',  'weights/alien_plushie_v5.pt')
-        #self.declare_parameter('model_path',  'weights/books.pt')
         self.declare_parameter('confidence',  0.50)
         self.declare_parameter('max_history', 5)
         self.declare_parameter('max_jump',    2.0)
+        self.declare_parameter('bb_margin',   0.46)
 
         self.model_path           = self.get_parameter('model_path').value
         self.confidence_threshold = self.get_parameter('confidence').value
         self.max_history          = self.get_parameter('max_history').value
         self.max_jump             = self.get_parameter('max_jump').value
+        self.bb_margin            = self.get_parameter('bb_margin').value
 
         self.fx = 616.0  # Focal length in pixels (x-axis)
         self.fy = 616.0  # Focal length in pixels (y-axis)
@@ -140,8 +141,8 @@ class FineTuneYoloNode(Node):
 
                     # --- Valeur max pour la marge : 0.5 => pixel central uniquement
                     # --- 0.375 => 25% de la BB d'origine
-                    margin_x = int((x2 - x1) * 0.46)                         
-                    margin_y = int((y2 - y1) * 0.46)     
+                    margin_x = int((x2 - x1) * self.bb_margin)                         
+                    margin_y = int((y2 - y1) * self.bb_margin)     
 
                     y1_p = max(0, y1 + margin_y)  
                     y2_p = min(cv_depth_image.shape[0], y2 - margin_y)    

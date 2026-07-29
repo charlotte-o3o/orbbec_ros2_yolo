@@ -90,63 +90,100 @@ class SpeedDetNode(Node):
             self.get_logger().info("Record mode OFF.")
 
         ######################################################################
-        #                                                                    #
+        #                    CONFIGURABLE PARAMETERS                         #
         ######################################################################
-        
-        self.throw_detected = False
-        self.previous_throw_detected = False
-        self.throw_coordinates = None
-        self.previous_object_center_meters = None
-        self.previous_object_timestamp = None
 
-        self.smoothed_object_meters = None
-        self.alpha_smooth = 0.4       
-        self.last_object_meters = None
-        self.last_world_pos = None
-        self.last_timestamp = None
+        self.alpha_smooth = self.declare_parameter('alpha_smooth', 0.4).value
+        self.cooldown_duration = self.declare_parameter(
+            'cooldown_duration', 8.0
+        ).value
+        self.max_false_frames_allowed = self.declare_parameter(
+            'max_false_frames_allowed', 10
+        ).value
+        self.trajectory_tracking_duration = self.declare_parameter(
+            'trajectory_tracking_duration', 3.0
+        ).value
+        self.history_sampling_interval = self.declare_parameter(
+            'history_sampling_interval', 0.10
+        ).value
+        self.speed_threshold = self.declare_parameter(
+            'speed_threshold', 2.0
+        ).value
+        self.startup_grace_period = self.declare_parameter( # s, aucun lancer ne peut etre detecte avant ce delai apres le lancement du node
+            'startup_grace_period', 8.0
+        ).value
+        self.throw_confirm_frames = self.declare_parameter( # L'objet doit être rapide pendant au moins 3 frames consécutives
+            'throw_confirm_frames', 3
+        ).value
 
-        self.cooldown_duration = 8.0   
-        self.last_throw_trigger_time = 0.0 
-        
-        self.false_frame_counter = 0      
-        self.max_false_frames_allowed = 10
+        # Garde-fous physiques
+        self.min_valid_z = self.declare_parameter('min_valid_z', 0.1).value
+        self.max_valid_z = self.declare_parameter('max_valid_z', 10.0).value
+        self.max_valid_xy = self.declare_parameter('max_valid_xy', 5.0).value
+        self.min_valid_dt = self.declare_parameter('min_valid_dt', 0.01).value # s, en dessous : bruit temporel -> vitesse qui explose
+        self.max_valid_speed = self.declare_parameter(
+            'max_valid_speed', 25.0
+        ).value
 
-        self.trajectory_tracking_active = False
-        self.predicted_trajectory = None          # Derniere prediction "vivante" (une seule courbe, ecrasee a chaque frame)
-        self.trajectory_start_time = None
-        self.trajectory_start_frame = None         # numero de frame du premier point du lancer (pour retrouver le lancer dans la video)
-        self.trajectory_tracking_duration = 5.0
-        self.trajectory_observed = []              # Points REELLEMENT mesures depuis le debut du lancer (t, x, y, z)
-        self.trajectory_history = []                # Predictions echantillonnees (pour visualiser l'evolution, pas toutes les frames)
-        self.history_sampling_interval = 0.10        # secondes entre deux predictions archivees (independant du fps)
-        self.last_history_sample_time = None
+        # Détection d'atterrissage
+        self.landing_z_threshold = self.declare_parameter(
+            'landing_z_threshold', 0.1
+        ).value
+        self.min_time_before_landing_check = self.declare_parameter( # s, temps minimum de suivi avant d'autoriser la detection d'atterrissage
+            'min_time_before_landing_check', 0.15
+        ).value
+        self.landing_confirm_frames = self.declare_parameter(
+            'landing_confirm_frames', 3
+        ).value
 
-        self.speed_threshold = 2.0
-        self.startup_grace_period = 8.0  # s, aucun lancer ne peut etre detecte avant ce delai apres le lancement du node
-        self.throw_confirm_frames = 3      # L'objet doit être rapide pendant au moins 3 frames consécutives
-        self.throw_confirm_counter = 0
+        # Bornes verticales & Caméra
+        self.max_predicted_height = self.declare_parameter(
+            'max_predicted_height', 2.0
+        ).value
+        self.max_predicted_fall = self.declare_parameter(
+            'max_predicted_fall', -2.0
+        ).value
+        self.camera_tilt_deg = self.declare_parameter(
+            'camera_tilt_deg', 0.0
+        ).value
 
-        # --- Garde-fous physiques : toute position/mise a jour hors de ces bornes est rejetee ---
-        self.min_valid_z = 0.1        # m, en dessous : profondeur invalide/trop proche
-        self.max_valid_z = 10.0        # m, au-dela : profondeur aberrante
-        self.max_valid_xy = 5.0        # m, deplacement lateral/vertical plausible dans la piece
-        self.min_valid_dt = 0.01       # s, en dessous : bruit temporel -> vitesse qui explose
-        self.max_valid_speed = 25.0    # m/s, au-dela : vitesse non physique pour un lancer a la main
-
-        # --- Debounce pour la detection d'atterrissage : evite un arret sur la 1ere frame ---
-        self.landing_z_threshold = 0.1                  # m, objet considere "arrive" quand il est a moins de 10cm de la camera
-        self.min_time_before_landing_check = 0.15       # s, temps minimum de suivi avant d'autoriser la detection d'atterrissage
-        self.landing_confirm_frames = 3                 # nb de frames consecutives sous le seuil pour confirmer
-        self.landing_confirm_counter = 0
-
-        # --- Bornes physiques verticales (repere: Y positif = vers le bas, Y negatif = vers le haut) ---
-        # A adapter a ta piece/setup si besoin.
-        self.max_predicted_height = 2.0   # m, Y ne doit jamais monter en dessous de ca (2m au-dessus de l'origine camera)
-        self.max_predicted_fall = -2.0      # m, Y ne doit jamais depasser ca vers le bas (sol/limite basse plausible)
-
-        self.camera_tilt_deg = 45.0  # Ajuste l'angle réel de ton trépied ici
+        # Variable dérivée (se calcule à partir du paramètre)
         self.theta = np.radians(self.camera_tilt_deg)
 
+        ######################################################################
+        #                   INTERNAL TRACKING STATUSES                       #
+        ######################################################################
+
+        # Flags et événements
+        self.throw_detected = False
+        self.previous_throw_detected = False
+        self.trajectory_tracking_active = False
+
+        # Coordonnées, mesures et géométrie
+        self.throw_coordinates = None
+        self.previous_object_center_meters = None
+        self.smoothed_object_meters = None
+        self.last_object_meters = None
+        self.last_world_pos = None
+
+        # Timestamps et temporisateurs
+        self.previous_object_timestamp = None
+        self.last_timestamp = None
+        self.last_throw_trigger_time = 0.0
+        self.trajectory_start_time = None
+        self.trajectory_start_frame = None
+        self.last_history_sample_time = None
+
+        # Compteurs de frames
+        self.false_frame_counter = 0
+        self.throw_confirm_counter = 0
+        self.landing_confirm_counter = 0
+
+        # Historiques et trajectoires
+        self.predicted_trajectory = None
+        self.trajectory_observed = []
+        self.trajectory_history = []
+        
         ######################################################################
         #                                                                    #
         ######################################################################

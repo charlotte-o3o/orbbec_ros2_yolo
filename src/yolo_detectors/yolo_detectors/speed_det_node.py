@@ -872,24 +872,24 @@ class SpeedDetNode(Node):
             self.get_logger().info(f"Error in the synchronized callback : {e}")
 
     def destroy_node(self):
-            """
-            Safely cleanup resources, flush log files, release video writers, 
-            and save partial plot figures when shutting down the node.
-            """
-            if getattr(self, 'trajectory_tracking_active', False) and self.trajectory_observed:           
-                self.get_logger().info("\nNode shutting down with an active throw: saving partial trajectory plot...")
-                self.trajectory_tracking_active = False
-                self.plot_trajectory_history()
+        """
+        Safely cleanup resources, flush log files, release video writers, 
+        and save partial plot figures when shutting down the node.
+        """
+        if getattr(self, 'trajectory_tracking_active', False) and self.trajectory_observed:           
+            self.get_logger().info("\nNode shutting down with an active throw: saving partial trajectory plot...")
+            self.trajectory_tracking_active = False
+            self.plot_trajectory_history()
 
-            if hasattr(self, 'video_writer') and self.video_writer is not None:
-                self.video_writer.release()
-                self.get_logger().info(f"\nRecord video saved : {self.record_path}")
+        if hasattr(self, 'video_writer') and self.video_writer is not None:
+            self.video_writer.release()
+            self.get_logger().info(f"\nRecord video saved : {self.record_path}")
 
-            if hasattr(self, 'csv_file') and self.csv_file is not None and not self.csv_file.closed:
-                self.csv_file.close()
-                self.get_logger().info("\nCSV file flushed and closed correctly.")
-            cv2.destroyAllWindows()
-            return super().destroy_node()
+        if hasattr(self, 'csv_file') and self.csv_file is not None and not self.csv_file.closed:
+            self.csv_file.close()
+            self.get_logger().info("\nCSV file flushed and closed correctly.")
+        cv2.destroyAllWindows()
+        return super().destroy_node()
 
 def main(args=None):
     

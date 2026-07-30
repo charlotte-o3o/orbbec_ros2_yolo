@@ -12,7 +12,6 @@ __pycache__/
 
 # Node files
 test_subscriber_node.py
-yolo_world_node.py
 train_stgcn.py
 inference_stgcn_node.py
 collect_data_node.py
@@ -20,6 +19,12 @@ double_detection_node.py
 mathematical_throw_detection_node.py
 test_subscriber_node.py
 lstm_node.py
+speed_det_node.py
+fine_tune_yolo.py
+
+# Launch, config, param files
+speed_det.launch.py
+speed_det_params.yaml
 
 # Other files (ide, env, ...)
 cyclonedds_host.xml

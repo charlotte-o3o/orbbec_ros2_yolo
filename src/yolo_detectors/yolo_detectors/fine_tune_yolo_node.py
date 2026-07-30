@@ -10,7 +10,7 @@ from sensor_msgs.msg import CameraInfo, Image
 import rclpy
 import cv2
 from cv_bridge import CvBridge
-from ultralytics import YOLO, YOLOWorld
+from ultralytics import YOLO
 import message_filters
 import random
 import numpy as np
@@ -47,6 +47,8 @@ class FineTuneYoloNode(Node):
         self.distance_history: list[float] = []
         self.consecutive_jumps = 0
         self.box_color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
+
+        self.last_valid_time = self.get_clock().now()
 
         self.get_logger().info("*** YOLO Node Launched successfully ***")
 
@@ -164,19 +166,24 @@ class FineTuneYoloNode(Node):
                     else:                                                              
                         distance = 0.0  
 
+                    current_time = self.get_clock().now()
+                    dt = (current_time - self.last_valid_time).nanoseconds / 1e9  # Temps écoulé en secondes
+                    dynamic_max_jump = max(0.20, self.max_velocity * dt)
+
                     if distance > 0 and len(self.distance_history) > 0:
-                        if abs(distance - self.distance_history[-1]) > self.max_jump:
+                        if abs(distance - self.distance_history[-1]) > dynamic_max_jump:
                             self.consecutive_jumps += 1
 
-                            if self.consecutive_jumps > 10:
-                                self.get_logger().warn("Filtre Z bloqué détecté ! Réinitialisation de l'historique.")
+                            if self.consecutive_jumps > 5:
+                                self.get_logger().warn("Blocked Z-filter detected! Resetting history.")
                                 self.distance_history.clear()
                                 self.consecutive_jumps = 0
                             else:
                                 distance = self.distance_history[-1]  
 
                         else:
-                            self.consecutive_jumps = 0
+                            self.consecutive_jumps = 0  
+                            self.last_valid_time = current_time
 
                     if distance > 0:                              
                         self.distance_history.append(distance)   

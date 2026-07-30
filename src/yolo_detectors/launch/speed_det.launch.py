@@ -8,7 +8,7 @@ import os
 config_file = os.path.join(
     get_package_share_directory('yolo_detectors'),
     'config',
-    'params.yaml'
+    'speed_det_params.yaml'
 )
 
 def generate_launch_description():

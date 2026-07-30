@@ -7,7 +7,6 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;*.warning=false"
 import rclpy
 from rclpy.node import Node
 from lancer_interfaces.msg import HumanPoseArray, LandingPrediction
-from lancer_interfaces.msg import HumanPoseArray
 import message_filters
 from vision_msgs.msg import Detection2DArray
 from cv_bridge import CvBridge

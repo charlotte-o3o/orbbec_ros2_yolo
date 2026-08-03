@@ -5,11 +5,7 @@ yolo_world_node:
     max_jump: 0.5
     bb_margin: 0.46
     custom_classes:
-      - "plastic bottle"
-      - "cardboard_box"
-      - "alien_plushie"
-      - "juice_bottle"
-      - "bottle"
+      - "football_ball"
 
 yolo_pose_node:
   ros__parameters:
@@ -18,5 +14,9 @@ yolo_pose_node:
 
 optical_tracking_node:
   ros__parameters:
-    max_dist_meter: 20.0
-    mask_thickness: 0.4
+    max_dist_meter: 0.25
+    mask_thickness_arm: 0.4
+    mask_thickness_hand: 0.25
+    target_class_id: "football_ball"
+    debug_mask_overlay: true
+    record_mode: false

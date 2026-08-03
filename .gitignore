@@ -3,8 +3,8 @@
 yolo26n.pt
 stgcn_lancer.pt
 books.pt
-*.pth
 alien_plushie_v5.pt
+*.pth
 
 # Python files
 __pycache__/

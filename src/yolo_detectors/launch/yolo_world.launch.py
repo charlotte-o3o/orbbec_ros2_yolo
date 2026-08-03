@@ -20,9 +20,7 @@ def generate_launch_description():
             executable='yolo_world',
             name='yolo_world_node',
             output='screen',
-            parameters=[{
-                config_file,
-            }],
+            parameters=[config_file],
         ),
 
         Node(
@@ -30,9 +28,7 @@ def generate_launch_description():
             executable='yolo_pose',
             name='yolo_pose_node',
             output='screen',
-            parameters=[{
-                config_file,
-            }],
+            parameters=[config_file],
         ),
 
     ])

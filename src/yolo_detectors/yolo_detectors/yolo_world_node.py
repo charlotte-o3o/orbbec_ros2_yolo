@@ -31,16 +31,24 @@ class YoloWorldNode(Node):
             "book",
             "person",
             "computer",
-            "laptop"
+            "laptop",
+            "banana",
+            "ball",
+            "football_ball",
+            "soccer_ball",
+            "white_box",
+            "white_cardboard_box"
         ]
 
-        self.model_path           = self.declare_parameter('model_path',     '/weights/yolov8s-world.pt').value
+        self.model_path           = self.declare_parameter('model_path',     'weights/yolov8s-world.pt').value
         self.confidence_threshold = self.declare_parameter('confidence',     0.50).value
         self.max_history          = self.declare_parameter('max_history',    5).value
         self.max_jump             = self.declare_parameter('max_jump',       0.5).value
         self.bb_margin            = self.declare_parameter('bb_margin',      0.46).value
-        self.custom_classes       = self.declare_parameter('custom_classes', default_classes).value
         self.max_velocity         = self.declare_parameter('max_velocity',   5.0).value
+        self.declare_parameter('custom_classes', default_classes)
+        self.custom_classes       = list(self.get_parameter('custom_classes').value)
+        
 
         self.fx = 616.0  # Focal length in pixels (x-axis)
         self.fy = 616.0  # Focal length in pixels (y-axis)

@@ -5,6 +5,7 @@ yolov8s-world.pt
 stgcn_lancer.pt
 books.pt
 *.pth
+alien_plushie_v5.pt
 
 # Python files
 __pycache__/

@@ -1,4 +1,4 @@
-fine_tune_yolo_node:
+yolo_world_node:
   ros__parameters:
     confidence: 0.50
     max_history: 5
@@ -11,6 +11,12 @@ fine_tune_yolo_node:
       - "juice_bottle"
       - "bottle"
 
+yolo_pose_node:
+  ros__parameters:
+      model_path: 'weights/yolo26n-pose.pt'
+      confidence: 0.50
+
 optical_tracking_node:
   ros__parameters:
     max_dist_meter: 20.0
+    mask_thickness: 0.4

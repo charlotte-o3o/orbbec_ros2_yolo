@@ -25,4 +25,14 @@ def generate_launch_description():
             }],
         ),
 
+        Node(
+            package='yolo_detectors',
+            executable='yolo_pose',
+            name='yolo_pose_node',
+            output='screen',
+            parameters=[{
+                config_file,
+            }],
+        ),
+
     ])

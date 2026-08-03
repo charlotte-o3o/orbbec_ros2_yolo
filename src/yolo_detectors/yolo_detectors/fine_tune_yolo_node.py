@@ -27,12 +27,14 @@ class FineTuneYoloNode(Node):
         self.declare_parameter('max_history', 5)
         self.declare_parameter('max_jump',    2.0)
         self.declare_parameter('bb_margin',   0.46)
+        self.declare_parameter('max_velocity', 5.0)
 
         self.model_path           = self.get_parameter('model_path').value
         self.confidence_threshold = self.get_parameter('confidence').value
         self.max_history          = self.get_parameter('max_history').value
         self.max_jump             = self.get_parameter('max_jump').value
         self.bb_margin            = self.get_parameter('bb_margin').value
+        self.max_velocity         = self.get_parameter('max_velocity').value
 
         self.fx = 616.0  # Focal length in pixels (x-axis)
         self.fy = 616.0  # Focal length in pixels (y-axis)

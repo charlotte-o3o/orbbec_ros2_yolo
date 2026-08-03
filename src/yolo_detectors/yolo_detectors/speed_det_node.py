@@ -50,40 +50,6 @@ class SpeedDetNode(Node):
         self.timestamp_csv = time.strftime("%Y-%m-%d_%H-%M-%S")
 
         ######################################################################
-        #                        DATA LOGGING SETUP                          #
-        ######################################################################
-        
-        if self.save_distance_mode:
-            self.get_logger().info("Distances save mode ON.")
-            self.distance_log_dir = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "speed_detection", "csv_distances")
-            if not os.path.exists(self.distance_log_dir):
-                os.makedirs(self.distance_log_dir)
-                self.get_logger().info(f"Directory created: {self.distance_log_dir}")                     
-            self.csv_path = os.path.join(self.distance_log_dir,                   
-                                    f"distances_{self.timestamp_csv}.csv")         
-
-            self.csv_file = open(self.csv_path, mode='w', newline='')
-            self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow(['frame', 'timestamp', 'X(m)', 'Y(m)', 'Z(m)', 'object_speed_m_s', 'label'])
-            self.csv_file.flush()
-
-            self.get_logger().info(f"CSV file created : {self.csv_path}")
-
-        else:
-            self.get_logger().info("Distances save mode OFF.")
-
-        if self.record_mode:
-            self.get_logger().info("Record mode ON.")
-            self.video_writer = None
-            self.video_folder = "data/captures_videos"       
-            if not os.path.exists(self.video_folder):
-                os.makedirs(self.video_folder)
-                self.get_logger().info(f"Recording directory created : {self.video_folder}")
-
-        else:
-            self.get_logger().info("Record mode OFF.")
-
-        ######################################################################
         #                      CONFIGURABLE PARAMETERS                       #
         ######################################################################
 
@@ -148,6 +114,40 @@ class SpeedDetNode(Node):
 
         # Derivated variable
         self.theta = np.radians(self.camera_tilt_deg)
+
+        ######################################################################
+        #                        DATA LOGGING SETUP                          #
+        ######################################################################
+        
+        if self.save_distance_mode:
+            self.get_logger().info("Distances save mode ON.")
+            self.distance_log_dir = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "speed_detection", "csv_distances")
+            if not os.path.exists(self.distance_log_dir):
+                os.makedirs(self.distance_log_dir)
+                self.get_logger().info(f"Directory created: {self.distance_log_dir}")                     
+            self.csv_path = os.path.join(self.distance_log_dir,                   
+                                    f"distances_{self.timestamp_csv}.csv")         
+
+            self.csv_file = open(self.csv_path, mode='w', newline='')
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(['frame', 'timestamp', 'X(m)', 'Y(m)', 'Z(m)', 'object_speed_m_s', 'label'])
+            self.csv_file.flush()
+
+            self.get_logger().info(f"CSV file created : {self.csv_path}")
+
+        else:
+            self.get_logger().info("Distances save mode OFF.")
+
+        if self.record_mode:
+            self.get_logger().info("Record mode ON.")
+            self.video_writer = None
+            self.video_folder = "data/captures_videos"       
+            if not os.path.exists(self.video_folder):
+                os.makedirs(self.video_folder)
+                self.get_logger().info(f"Recording directory created : {self.video_folder}")
+
+        else:
+            self.get_logger().info("Record mode OFF.")
 
         ######################################################################
         #                   INTERNAL TRACKING STATUSES                       #

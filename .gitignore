@@ -1,7 +1,6 @@
 # Data files (videos and weights)
 *.avi
 yolo26n.pt
-yolov8s-world.pt
 stgcn_lancer.pt
 books.pt
 *.pth

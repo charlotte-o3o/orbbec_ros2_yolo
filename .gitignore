@@ -39,7 +39,7 @@ log/
 
 # Packages directories
 src/yolo_detectors/test
-src/g1_arm_control/test
+src/g1_arm_control/
 
 # Other directories
 Log/

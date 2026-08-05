@@ -20,9 +20,7 @@ def generate_launch_description():
             executable='fine_tune_yolo',
             name='fine_tune_yolo_node',
             output='screen',
-            parameters=[{
-                config_file,
-            }],
+            parameters=[config_file],
         ),
 
         # --- Détection de pose (publie /yolo_detected_poses) ---
@@ -31,9 +29,7 @@ def generate_launch_description():
             executable='yolo_pose',
             name='yolo_pose_node',
             output='screen',
-            parameters=[{
-                config_file,
-            }],
+            parameters=[config_file],
         ),
 
         # --- Détection de lancer basée sur la vitesse : dépend des 2 nœuds ci-dessus ---
@@ -43,8 +39,6 @@ def generate_launch_description():
             executable='speed_det',
             name='speed_det_node',
             output='screen',
-            parameters=[{
-                config_file,
-            }],
+            parameters=[config_file],
         ),
     ])

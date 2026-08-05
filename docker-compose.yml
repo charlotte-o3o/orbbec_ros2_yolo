@@ -35,4 +35,4 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix
 
     # Commande par défaut au lancement
-    command: ros2 launch yolo_detectors throw_det.launch.py
+    command: ros2 launch yolo_detectors speed_det.launch.py

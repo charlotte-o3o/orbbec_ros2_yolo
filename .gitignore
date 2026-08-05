@@ -20,6 +20,7 @@ double_detection_node.py
 mathematical_throw_detection_node.py
 test_subscriber_node.py
 lstm_node.py
+old_speed_det_node.py
 
 # Other files (ide, env, ...)
 cyclonedds_host.xml

@@ -7,7 +7,6 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;*.warning=false"
 import rclpy
 from rclpy.node import Node
 from lancer_interfaces.msg import HumanPoseArray, LandingPrediction
-from lancer_interfaces.msg import HumanPoseArray
 import message_filters
 from vision_msgs.msg import Detection2DArray
 from cv_bridge import CvBridge
@@ -30,25 +29,66 @@ class SpeedDetNode(Node):
 
         self.bridge = CvBridge()
 
-        self.box_color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))   
+        self.box_color         = (random.randint(0,255), random.randint(0,255), random.randint(0,255))   
         self.right_wrist_color = (241, 255, 81)
-        self.left_wrist_color = (218, 110, 255)
+        self.left_wrist_color  = (218, 110, 255)
 
         ######################################################################
         #          CAMERA PARAMETERS (to be updated from CameraInfo)         #
         ######################################################################
 
-        self.fps_camera = 30.0
-        self.fx = 616.0  # Focal length in pixels (x-axis)
-        self.fy = 616.0  # Focal length in pixels (y-axis)
-        self.cx = 320.0  # Principal point x-coordinate (image center)      
-        self.cy = 240.0  # Principal point y-coordinate (image center)
+        self.fps_camera      = 30.0
+        self.fx              = 616.0  # Focal length in pixels (x-axis)
+        self.fy              = 616.0  # Focal length in pixels (y-axis)
+        self.cx              = 320.0  # Principal point x-coordinate (image center)      
+        self.cy              = 240.0  # Principal point y-coordinate (image center)
         self.has_camera_info = False
 
         self.frame_count = 1
 
-        self.start_time = time.time()
+        self.start_time    = time.time()
         self.timestamp_csv = time.strftime("%Y-%m-%d_%H-%M-%S")
+
+        ######################################################################
+        #                      CONFIGURABLE PARAMETERS                       #
+        ######################################################################
+
+        # Operating modes (Toggles / Flags)
+        self.save_distance_mode                 = self.declare_parameter('save_distance_mode', False).value
+        self.record_mode                        = self.declare_parameter('record_mode', False).value
+        self.annotations_mode                   = self.declare_parameter('annotations_mode', True).value
+
+        # Throw detection parameters
+        self.alpha_smooth                       = self.declare_parameter('alpha_smooth', 0.4).value
+        self.cooldown_duration                  = self.declare_parameter('cooldown_duration', 8.0).value
+        self.max_false_frames_allowed           = self.declare_parameter('max_false_frames_allowed', 10).value
+        self.trajectory_tracking_duration       = self.declare_parameter('trajectory_tracking_duration', 3.0).value
+        self.history_sampling_interval          = self.declare_parameter('history_sampling_interval', 0.10).value
+        self.speed_threshold                    = self.declare_parameter('speed_threshold', 2.0).value
+        self.startup_grace_period               = self.declare_parameter('startup_grace_period', 8.0).value # s, no throw detection during the first seconds after node startup
+        self.throw_confirm_frames               = self.declare_parameter('throw_confirm_frames', 3).value # the object must be detected as a throw for N consecutive frames to confirm the detection
+
+        # Physical safeguards
+        self.min_valid_z                        = self.declare_parameter('min_valid_z', 0.1).value
+        self.max_valid_z                        = self.declare_parameter('max_valid_z', 10.0).value
+        self.max_valid_xy                       = self.declare_parameter('max_valid_xy', 5.0).value
+        self.min_valid_dt                       = self.declare_parameter('min_valid_dt', 0.01).value # s, below this value: temporal noise -> exploding speed
+        self.max_valid_speed                    = self.declare_parameter('max_valid_speed', 25.0).value
+        self.min_valid_speed                    = self.declare_parameter('min_valid_speed', -0.2).value
+        self.non_approaching_velocity_threshold = self.declare_parameter('non_approaching_velocity_threshold', -0.05).value
+
+        # Landing detection
+        self.landing_z_threshold                = self.declare_parameter('landing_z_threshold', 0.5).value
+        self.min_time_before_landing_check      = self.declare_parameter('min_time_before_landing_check', 0.15).value
+        self.landing_confirm_frames             = self.declare_parameter('landing_confirm_frames', 3).value
+
+        # Predicted trajectory limits
+        self.max_predicted_height               = self.declare_parameter('max_predicted_height', 2.0).value
+        self.max_predicted_fall                 = self.declare_parameter('max_predicted_fall', -2.0).value
+        self.camera_tilt_deg                    = self.declare_parameter('camera_tilt_deg', 15.0).value
+
+        # Derivated variable
+        self.theta = np.radians(self.camera_tilt_deg)
 
         ######################################################################
         #                        DATA LOGGING SETUP                          #
@@ -85,110 +125,44 @@ class SpeedDetNode(Node):
             self.get_logger().info("Record mode OFF.")
 
         ######################################################################
-        #                      CONFIGURABLE PARAMETERS                       #
-        ######################################################################
-
-        # Operating modes (Toggles / Flags)
-        self.save_distance_mode = self.declare_parameter('save_distance_mode', False).value
-        self.record_mode = self.declare_parameter('record_mode', False).value
-        self.annotations_mode = self.declare_parameter('annotations_mode', True).value
-
-        self.alpha_smooth = self.declare_parameter('alpha_smooth', 0.4).value
-        self.cooldown_duration = self.declare_parameter(
-            'cooldown_duration', 8.0
-        ).value
-        self.max_false_frames_allowed = self.declare_parameter(
-            'max_false_frames_allowed', 10
-        ).value
-        self.trajectory_tracking_duration = self.declare_parameter(
-            'trajectory_tracking_duration', 3.0
-        ).value
-        self.history_sampling_interval = self.declare_parameter(
-            'history_sampling_interval', 0.10
-        ).value
-        self.speed_threshold = self.declare_parameter(
-            'speed_threshold', 2.0
-        ).value
-        self.startup_grace_period = self.declare_parameter( # s, aucun lancer ne peut etre detecte avant ce delai apres le lancement du node
-            'startup_grace_period', 8.0
-        ).value
-        self.throw_confirm_frames = self.declare_parameter( # L'objet doit être rapide pendant au moins 3 frames consécutives
-            'throw_confirm_frames', 3
-        ).value
-
-        # Physical safeguards
-        self.min_valid_z = self.declare_parameter('min_valid_z', 0.1).value
-        self.max_valid_z = self.declare_parameter('max_valid_z', 10.0).value
-        self.max_valid_xy = self.declare_parameter('max_valid_xy', 5.0).value
-        self.min_valid_dt = self.declare_parameter('min_valid_dt', 0.01).value # s, en dessous : bruit temporel -> vitesse qui explose
-        self.max_valid_speed = self.declare_parameter(
-            'max_valid_speed', 25.0
-        ).value
-
-        # Landing detection
-        self.landing_z_threshold = self.declare_parameter(
-            'landing_z_threshold', 0.1
-        ).value
-        self.min_time_before_landing_check = self.declare_parameter( # s, temps minimum de suivi avant d'autoriser la detection d'atterrissage
-            'min_time_before_landing_check', 0.15
-        ).value
-        self.landing_confirm_frames = self.declare_parameter(
-            'landing_confirm_frames', 3
-        ).value
-
-        # Bornes verticales & Caméra
-        self.max_predicted_height = self.declare_parameter(
-            'max_predicted_height', 2.0
-        ).value
-        self.max_predicted_fall = self.declare_parameter(
-            'max_predicted_fall', -2.0
-        ).value
-        self.camera_tilt_deg = self.declare_parameter(
-            'camera_tilt_deg', 0.0
-        ).value
-
-        # Derivated variable
-        self.theta = np.radians(self.camera_tilt_deg)
-
-        ######################################################################
-        #                   INTERNAL TRACKING STATUSES                       #
+        #                INTERNAL TRACKING STATUSES & COUNTERS               #
         ######################################################################
 
         # Flags and events
-        self.throw_detected = False
-        self.previous_throw_detected = False
-        self.trajectory_tracking_active = False
+        self.throw_detected                = False
+        self.previous_throw_detected       = False
+        self.trajectory_tracking_active    = False
 
         # Coordinates, measurements, and geometry
-        self.throw_coordinates = None
+        self.throw_coordinates             = None
         self.previous_object_center_meters = None
-        self.smoothed_object_meters = None
-        self.last_object_meters = None
-        self.last_world_pos = None
+        self.smoothed_object_meters        = None
+        self.last_object_meters            = None
+        self.last_world_pos                = None
 
         # Timestamps and timers
-        self.previous_object_timestamp = None
-        self.last_timestamp = None
-        self.last_throw_trigger_time = 0.0
-        self.trajectory_start_time = None
-        self.trajectory_start_frame = None
-        self.last_history_sample_time = None
+        self.previous_object_timestamp     = None
+        self.last_timestamp                = None
+        self.last_throw_trigger_time       = 0.0
+        self.trajectory_start_time         = None
+        self.trajectory_start_frame        = None
+        self.last_history_sample_time      = None
 
         # Frame counters
-        self.false_frame_counter = 0
-        self.throw_confirm_counter = 0
-        self.landing_confirm_counter = 0
+        self.false_frame_counter           = 0
+        self.throw_confirm_counter         = 0
+        self.landing_confirm_counter       = 0
 
         # Histories and trajectories
-        self.predicted_trajectory = None
-        self.trajectory_observed = []
-        self.trajectory_history = []
+        self.predicted_trajectory          = None
+        self.trajectory_observed           = []
+        self.trajectory_history            = []
         
         ######################################################################
         #                           PUBLISHERS                               #
         ######################################################################
 
-        self.pub_landing = self.create_publisher(
+        self.pub_landing        = self.create_publisher(
             LandingPrediction,
             '/trajectory/landing_prediction',
             10
@@ -198,20 +172,20 @@ class SpeedDetNode(Node):
         #                           SUBSCRIBERS                              #
         ######################################################################
 
-        self.sub_info = self.create_subscription(
+        self.sub_info           = self.create_subscription(
             CameraInfo,
             '/orbbec_external/color/camera_info',
             self.camera_info_callback,
             10
         )
 
-        self.sub_image = message_filters.Subscriber(
+        self.sub_image          = message_filters.Subscriber(
             self,
             Image,
             '/orbbec_external/color/image_raw'
         )
 
-        self.sub_depth = message_filters.Subscriber(
+        self.sub_depth          = message_filters.Subscriber(
             self,
             Image, 
             '/orbbec_external/depth/image_raw'
@@ -223,7 +197,7 @@ class SpeedDetNode(Node):
             '/yolo_detected_objects'
         )
 
-        self.sub_yolo_pose = message_filters.Subscriber(
+        self.sub_yolo_pose      = message_filters.Subscriber(
             self,
             HumanPoseArray,
             '/yolo_detected_poses'
@@ -294,7 +268,7 @@ class SpeedDetNode(Node):
             - time_to_landing (float or None): Remaining time (in s) before reaching the camera (Z = 0.0m)
         """
         if len(self.trajectory_observed) < 3:
-            return None, 0.0, 0.0, 0.0, 0.0, 0.0
+            return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
         ts = np.array([p[0] for p in self.trajectory_observed])
         xs = np.array([p[1] for p in self.trajectory_observed])
@@ -304,17 +278,17 @@ class SpeedDetNode(Node):
         # Linear regression (degree 1) for X and Z (uniform constant velocity)
         poly_x = np.polyfit(ts, xs, 1) 
         poly_z = np.polyfit(ts, zs, 1)
-
-        vx_moy = poly_x[0]
-        vz_moy = poly_z[0]
-
-        # If the global Z vector points in the wrong direction, the prediction is invalid
-        if vz_moy >= -0.05:
-            return None, vx_moy, vz_moy, 0.0, 0.0, 0.0
-
         # Gravitational adjustment of Y (Y-axis positive upwards)
         ys_adjusted = ys + 0.5 * g_const * (ts ** 2)
         poly_y = np.polyfit(ts, ys_adjusted, 1)
+
+        vx_moy = poly_x[0]
+        vy_moy = poly_y[0] - g_const * t_since_start 
+        vz_moy = poly_z[0]
+
+        # If the global Z vector points in the wrong direction, the prediction is invalid
+        if vz_moy >= self.non_approaching_velocity_threshold:
+            return None, vx_moy, vy_moy, vz_moy, 0.0, 0.0, 0.0
 
         ######################################################################
         #               ANALYTICAL CALCULATION OF THE LANDING                #
@@ -350,7 +324,7 @@ class SpeedDetNode(Node):
             raw_trajectory.append((t_future, x_pred, y_pred, z_pred))
 
             # Stop if the object virtually reaches the camera target
-            if z_pred <= self.landing_z_threshold and t_future > 0:
+            if z_pred <= 0.0 and t_future > 0:
                 break
 
             t_future += dt_frame
@@ -361,14 +335,14 @@ class SpeedDetNode(Node):
             last_y = last_point[2]
             last_z = last_point[3]
 
-            if last_y <= self.max_predicted_fall and last_z > (self.landing_z_threshold + 0.10):
+            if last_y <= self.max_predicted_fall and last_z > self.landing_z_threshold:
                 self.get_logger().warn(
                     f"Trajectory prediction rejected (cliff effect): object hit the floor at Z={last_z:.2f}m "
                     f"instead of reaching the camera | estimated vz: {vz_moy:.3f} m/s"
                 )
-                return None, vx_moy, vz_moy, 0.0, 0.0, 0.0
+                return None, vx_moy, vy_moy, vz_moy, 0.0, 0.0, 0.0
 
-        return raw_trajectory, vx_moy, vz_moy, x_at_landing, y_at_landing, time_to_landing
+        return raw_trajectory, vx_moy, vy_moy, vz_moy, x_at_landing, y_at_landing, time_to_landing
 
     def plot_trajectory_history(self):
         if not self.trajectory_observed and not self.trajectory_history:
@@ -449,6 +423,44 @@ class SpeedDetNode(Node):
         self.trajectory_history = []
         self.predicted_trajectory = None
         self.last_history_sample_time = None
+
+    def check_workspace_intersection(self, pos_0, vel_0, g=9.81):
+        """
+        Compute the time and position of entry into the robot's capture box.
+        pos_0: [x0, y0, z0] at time t=0
+        vel_0: [vx, vy, vz] at time t=0
+        """
+        x0, y0, z0 = pos_0
+        vx, vy, vz = vel_0
+
+        # Definition of the robot's capture box (in meters, in the camera's reference frame)
+        """X_MIN, X_MAX = -0.25, -0.11   
+        Y_MIN, Y_MAX = -0.09, 0.21   
+        Z_MIN, Z_MAX =  0.0, 0.17"""   
+        X_MIN, X_MAX = -0.40, 0
+        Y_MIN, Y_MAX = -1, 1
+        Z_MIN, Z_MAX =  0.0, 0.2
+
+        # Sampling of the future of the parabola (e.g., over 1.5 seconds with a step of 10ms)
+        time_steps = np.linspace(0.01, 1.5, 150)
+
+        for t in time_steps:
+            # Trajectory equations under gravity (Y-axis positive upwards)
+            x_t = x0 + vx * t
+            y_t = y0 + vy * t - 0.5 * g * (t**2)
+            z_t = z0 + vz * t
+
+            # Check if the point is inside the cube
+            in_x = X_MIN <= x_t <= X_MAX
+            in_y = Y_MIN <= y_t <= Y_MAX
+            in_z = Z_MIN <= z_t <= Z_MAX
+
+            if in_x and in_y and in_z:
+                # First point of intersection found => capture point and time to landing
+                return True, t, x_t, y_t, z_t
+
+        # No trajectory point intersects the workspace cube
+        return False, None, None, None, None
 
     def synchronized_callback(self, color_msg, depth_msg, yolo_objects, yolo_poses):
         try: 
@@ -576,8 +588,8 @@ class SpeedDetNode(Node):
                 # Transformation from camera coordinates to world coordinates 
                 # (assuming camera is tilted by theta around the X-axis)
                 rx_world = - rx_cam
-                ry_world =   ry_cam * np.cos(self.theta) - rz_cam * np.sin(self.theta)
-                rz_world =   ry_cam * np.sin(self.theta) + rz_cam * np.cos(self.theta)
+                ry_world = - ry_cam * np.cos(self.theta) + rz_cam * np.sin(self.theta)
+                rz_world = - ry_cam * np.sin(self.theta) + rz_cam * np.cos(self.theta)
 
                 current_world_pos = [rx_world, ry_world, rz_world]
 
@@ -656,7 +668,6 @@ class SpeedDetNode(Node):
                             self.last_history_sample_time = None
                             self.landing_confirm_counter = 0
 
-                            print(f"\n\n----- FRAME {self.trajectory_start_frame} -----\n")
                             self.get_logger().info(f"Throw started (vrz = {vrz:.3f}m/s): trajectory prediction start !\n")
                         
                         else:
@@ -695,11 +706,11 @@ class SpeedDetNode(Node):
                             f"Trajectory update rejected: object speed too high = {object_speed_m_s:.1f} m/s."
                         )
 
-                    elif vrz > 0:
+                    elif vrz > self.non_approaching_velocity_threshold:
                        # The object is moving away from the camera (positive Z velocity)
                        self.get_logger().warn(f"Trajectory update rejected: vz positive = {vrz:.3f} m/s")
 
-                    elif object_speed_m_s >= self.speed_threshold and vrz < -0.05:
+                    elif object_speed_m_s >= self.speed_threshold and vrz < self.min_valid_speed:
                         # Calculate elapsed time since the throw trajectory started
                         t_since_start = current_timestamp - self.trajectory_start_time
 
@@ -724,16 +735,17 @@ class SpeedDetNode(Node):
                         # Re-calculate predictive trajectory every 2 frames 
                         # once at least 4 points have been collected
                         if len(self.trajectory_observed) >= 4 and len(self.trajectory_observed) % 2 == 0:
+                           
                             dt_frame = dt if dt is not None else (1.0 / self.fps_camera)
-                            raw_trajectory, vx_moy, vz_moy, x_at_landing, y_at_landing, time_to_landing = self.predict_smoothed_trajectory(t_since_start, dt_frame)
+                            raw_trajectory, vx_moy, vy_moy, vz_moy, x_at_landing, y_at_landing, time_to_landing = self.predict_smoothed_trajectory(t_since_start, dt_frame)
 
                             if raw_trajectory is None:
                                 # If prediction fails due to non-approaching velocity, 
                                 # discard the last anomalous point
-                                if vz_moy >= -0.05:
+                                if vz_moy >= self.non_approaching_velocity_threshold:
                                     self.get_logger().warn(
                                         f"Trajectory prediction rejected (global Vz positive or flat): "
-                                        f"Vx moy: {vx_moy:.2f}m/s | Vz moy: {vz_moy:.2f}m/s. Anomalous point removed."
+                                        f"Vx moy: {vx_moy:.2f}m/s | Vy moy: {vy_moy:.2f}m/s | Vz moy: {vz_moy:.2f}m/s. Anomalous point removed."
                                     )
                                     self.trajectory_observed.pop()
                                 self.predicted_trajectory = None
@@ -748,19 +760,30 @@ class SpeedDetNode(Node):
 
                                 self.get_logger().info(
                                     f"Trajectory updated ({len(self.trajectory_observed)} obs. pts) ---> "
-                                    f"Vx moy: {vx_moy:.2f}m/s | Vz moy: {vz_moy:.2f}m/s"
+                                    f"Vx moy: {vx_moy:.2f}m/s | Vy moy: {vy_moy:.2f}m/s | Vz moy: {vz_moy:.2f}m/s"
                                 )
-                                self.get_logger().info(
-                                    f"[PRED] X_landing: {x_at_landing:.2f}m | Y_landing: {y_at_landing:.2f}m | Impact in: {time_to_landing:.3f}s"
-                                )   
 
-                                # Publish predicted landing details to ROS 2 topic
-                                msg_pred = LandingPrediction()
-                                msg_pred.t_landing = float(time_to_landing)
-                                msg_pred.x_landing = float(x_at_landing)
-                                msg_pred.y_landing = float(y_at_landing)
-                                
-                                self.pub_landing.publish(msg_pred)
+                                # Compute the intersection of the predicted trajectory with the robot's 3D capture box
+                                has_target, t_intercept, x_target, y_target, z_target = self.check_workspace_intersection(
+                                    pos_0=[rx_world, ry_world, rz_world],
+                                    vel_0=[vx_moy, vy_moy, vz_moy]
+                                )
+
+                                if has_target:
+                                    self.get_logger().info(
+                                        f"[TARGET IN WORKSPACE] Capture point: X={x_target:.2f}m, Y={y_target:.2f}m, Z={z_target:.2f}m in {t_intercept:.3f}s"
+                                    )   
+
+                                    # Publishing of intersection point and time to landing for the robot to catch the object
+                                    msg_pred = LandingPrediction()
+                                    msg_pred.time_to_landing = float(t_intercept)
+                                    msg_pred.x_landing = float(x_target)
+                                    msg_pred.y_landing = float(y_target)
+                                    msg_pred.z_landing = float(z_target)
+                                    
+                                    self.pub_landing.publish(msg_pred)
+                                else:
+                                    self.get_logger().warn("Trajectory prediction active but DOES NOT intersect the 3D capture box!")
 
                         time_tracked = current_timestamp - self.trajectory_start_time
 
@@ -791,7 +814,6 @@ class SpeedDetNode(Node):
                 # Finalize tracking session and save trajectory plots if any stop condition was met
                 if stop_reason is not None:
                     self.trajectory_tracking_active = False
-                    print()
                     self.get_logger().info(stop_reason)
                     self.plot_trajectory_history()
 
@@ -862,7 +884,6 @@ class SpeedDetNode(Node):
 
             # Exit execution if ESC key (ASCII 27) is pressed
             if key == 27:
-                print("\n\n-----")
                 self.get_logger().info("ECHAP pressed. Shutting down the node...")
                 raise KeyboardInterrupt
     

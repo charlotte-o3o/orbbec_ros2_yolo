@@ -13,6 +13,7 @@ setup(
         ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']), 
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -31,7 +32,8 @@ setup(
             'double_detection = yolo_detectors.double_detection_node:main',
             'mathematical_throw_detection = yolo_detectors.mathematical_throw_detection_node:main',
             'lstm = yolo_detectors.lstm_node:main',
-            'speed_det = yolo_detectors.speed_det_node:main'
+            'speed_det = yolo_detectors.speed_det_node:main',
+            'optical_tracking = yolo_detectors.optical_tracking_node:main'
         ],
     },
 )

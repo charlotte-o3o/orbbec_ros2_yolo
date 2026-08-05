@@ -21,6 +21,7 @@ test_subscriber_node.py
 lstm_node.py
 speed_det_node.py
 fine_tune_yolo_node.py
+old_speed_det_node.py
 
 # Launch, config, param files
 speed_det.launch.py
@@ -43,7 +44,7 @@ log/
 
 # Packages directories
 src/yolo_detectors/test
-src/g1_arm_control/test
+src/g1_arm_control/
 
 # Other directories
 Log/

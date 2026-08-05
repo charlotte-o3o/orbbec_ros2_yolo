@@ -190,24 +190,28 @@ ros2_orbbec_ws/
 │   │   ├── msg/
 │   │   │   ├── HumanPose.msg
 │   │   │   ├── HumanPoseArray.msg
-│   │   │   └── Keypoint2D.msg
+│   │   │   ├── Keypoint2D.msg
+│   │   │   └── LandingPrediction.msg
 │   │   └── ...
 │   └── yolo_detectors/           # Main package
 │       ├── yolo_detectors/
 │       │   ├── yolo_pose_node.py
-│       │   ├── fine_tune_yolo_node.py
-│       │   ├── speed_det_node.py
+│       │   ├── yolo_world_node.py
+│       │   └── optical_tracking_node.py
 │       ├── config/
+│       │   └── yolo_world_params.yaml
+│       ├── launch/
+│       │   └── yolo_world.launch.py
 │       ├── resource/
 │       └── test/
 ├── weights/                      # Model weights
 │   ├── yolo26n-pose.pt
-│   └── alien_plushie_v5.pt
+│   └── yolov8s-world.pt
 ├── Dockerfile
 ├── docker-compose.yml
 ├── entrypoint.sh                 # Picks CYCLONEDDS_URI based on DEPLOYMENT_ENV
 ├── Makefile                      # make build / deploy / stop / logs / clean / attach / fix-daemon
-├── .env.example                  # Copy to .env and fill in
+├── .env.template                 # Copy to .env and fill in
 └── requirements.txt
 ```
 

@@ -262,22 +262,21 @@ class SpeedDetNode(Node):
         Returns:
             - raw_trajectory (list or None): Predicted future points [(t, x, y, z), ...]
             - vx_moy (float): Estimated average velocity along X
+            - vy_moy (float): Estimated average velocity along Y at t_since_start
             - vz_moy (float): Estimated average velocity along Z
-            - x_at_landing (float or None): Estimated X position at the landing plane Z = 0.0m
-            - y_at_landing (float or None): Estimated Y height at the landing plane Z = 0.0m
-            - time_to_landing (float or None): Remaining time (in s) before reaching the camera (Z = 0.0m)
         """
         if len(self.trajectory_observed) < 3:
-            return None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            return None, 0.0, 0.0, 0.0
 
         ts = np.array([p[0] for p in self.trajectory_observed])
         xs = np.array([p[1] for p in self.trajectory_observed])
         ys = np.array([p[2] for p in self.trajectory_observed])
         zs = np.array([p[3] for p in self.trajectory_observed])
 
-        # Linear regression (degree 1) for X and Z (uniform constant velocity)
+        # Linear regression (degree 1) for X and Z (constant velocity)
         poly_x = np.polyfit(ts, xs, 1) 
         poly_z = np.polyfit(ts, zs, 1)
+        
         # Gravitational adjustment of Y (Y-axis positive upwards)
         ys_adjusted = ys + 0.5 * g_const * (ts ** 2)
         poly_y = np.polyfit(ts, ys_adjusted, 1)
@@ -286,63 +285,33 @@ class SpeedDetNode(Node):
         vy_moy = poly_y[0] - g_const * t_since_start 
         vz_moy = poly_z[0]
 
-        # If the global Z vector points in the wrong direction, the prediction is invalid
+        # If the object is not moving towards the workspace (moving away or flat), prediction is invalid
         if vz_moy >= self.non_approaching_velocity_threshold:
-            return None, vx_moy, vy_moy, vz_moy, 0.0, 0.0, 0.0
-
-        ######################################################################
-        #               ANALYTICAL CALCULATION OF THE LANDING                #
-        #                     (WORLD REFERENCE FRAME)                        #
-        ######################################################################
-        # Z_world(t) = poly_z[0] * t + poly_z[1]
-        # We are looking for t_landing such that Z_world(t_landing) = 0.0
-        target_z_world = 0.0
-        t_landing = (target_z_world - poly_z[1]) / vz_moy
-        
-        # The remaining time before crossing the Z_world = 0 line
-        time_to_landing = t_landing - t_since_start
-        
-        # Calculation of the exact Y_world height at this precise moment
-        x_at_landing = poly_x[0] * t_landing + poly_x[1]
-        y_at_landing = -0.5 * g_const * (t_landing ** 2) + poly_y[0] * t_landing + poly_y[1]
-        # ==========================================
+            return None, vx_moy, vy_moy, vz_moy
 
         raw_trajectory = []
         t_future = t_since_start
-        max_time = t_since_start + 2.0  # Prediction up to 2 seconds in the future
+        max_time = t_since_start + 2.0  # Prediction horizon (2 seconds in future)
 
         while t_future <= max_time:
             x_pred = poly_x[0] * t_future + poly_x[1]
             y_pred = -0.5 * g_const * (t_future ** 2) + poly_y[0] * t_future + poly_y[1]
             z_pred = poly_z[0] * t_future + poly_z[1]
 
-            # Stop if the curve exits the physical vertical limits.
+            # Stop if the predicted point exits physical vertical boundaries
             if y_pred > self.max_predicted_height or y_pred < self.max_predicted_fall:
                 raw_trajectory.append((t_future, x_pred, y_pred, z_pred))
                 break
 
             raw_trajectory.append((t_future, x_pred, y_pred, z_pred))
 
-            # Stop if the object virtually reaches the camera target
+            # Stop if the object moves past Z <= 0
             if z_pred <= 0.0 and t_future > 0:
                 break
 
             t_future += dt_frame
 
-        # Verification of the Cliff Effect (premature collision with the ground)
-        if raw_trajectory:
-            last_point = raw_trajectory[-1]
-            last_y = last_point[2]
-            last_z = last_point[3]
-
-            if last_y <= self.max_predicted_fall and last_z > self.landing_z_threshold:
-                self.get_logger().warn(
-                    f"Trajectory prediction rejected (cliff effect): object hit the floor at Z={last_z:.2f}m "
-                    f"instead of reaching the camera | estimated vz: {vz_moy:.3f} m/s"
-                )
-                return None, vx_moy, vy_moy, vz_moy, 0.0, 0.0, 0.0
-
-        return raw_trajectory, vx_moy, vy_moy, vz_moy, x_at_landing, y_at_landing, time_to_landing
+        return raw_trajectory, vx_moy, vy_moy, vz_moy
 
     def plot_trajectory_history(self):
         if not self.trajectory_observed and not self.trajectory_history:
@@ -737,7 +706,7 @@ class SpeedDetNode(Node):
                         if len(self.trajectory_observed) >= 4 and len(self.trajectory_observed) % 2 == 0:
                            
                             dt_frame = dt if dt is not None else (1.0 / self.fps_camera)
-                            raw_trajectory, vx_moy, vy_moy, vz_moy, x_at_landing, y_at_landing, time_to_landing = self.predict_smoothed_trajectory(t_since_start, dt_frame)
+                            raw_trajectory, vx_moy, vy_moy, vz_moy = self.predict_smoothed_trajectory(t_since_start, dt_frame)
 
                             if raw_trajectory is None:
                                 # If prediction fails due to non-approaching velocity, 

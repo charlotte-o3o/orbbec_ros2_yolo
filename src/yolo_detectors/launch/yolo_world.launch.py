@@ -31,4 +31,12 @@ def generate_launch_description():
             parameters=[config_file],
         ),
 
+        Node(
+            package='yolo_detectors',
+            executable='optical_tracking',
+            name='optical_tracking_node',
+            output='screen',
+            parameters=[config_file],
+        ),
+
     ])

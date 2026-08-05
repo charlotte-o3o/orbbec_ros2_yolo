@@ -32,7 +32,7 @@ class OpticalTrackingNode(Node):
         self.max_dist_meter           = self.declare_parameter('max_dist_meter',   0.25).value
         self.mask_thickness_arm       = self.declare_parameter('mask_thickness_arm',   0.4).value
         self.mask_thickness_hand      = self.declare_parameter('mask_thickness_hand',   0.25).value
-        self.target_class_id          = self.declare_parameter('target_class_id', 'football_ball').value
+        self.target_class_id          = self.declare_parameter('target_class_id', 'bottle').value
 
         self.get_logger().info(f"Tracking node configured for target class: '{self.target_class_id}'")
 

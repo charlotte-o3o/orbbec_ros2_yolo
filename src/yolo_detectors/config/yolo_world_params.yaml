@@ -5,7 +5,7 @@ yolo_world_node:
     max_jump: 0.5
     bb_margin: 0.46
     custom_classes:
-      - "bottle"
+      - "alien_plushie"
 
 yolo_pose_node:
   ros__parameters:
@@ -17,8 +17,8 @@ optical_tracking_node:
     max_dist_meter: 0.25
     mask_thickness_arm: 0.4
     mask_thickness_hand: 0.25
-    target_class_id: "bottle"
+    target_class_id: "alien_plushie"
     debug_mask_overlay: true
     record_mode: false
-    camera_roll_deg: 90.0
+    camera_roll_deg: -90.0
     camera_tilt_deg: 0.0

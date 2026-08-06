@@ -509,12 +509,12 @@ class OpticalTrackingNode(Node):
         R_roll = np.array([
             [np.cos(alpha), -np.sin(alpha), 0],
             [np.sin(alpha),  np.cos(alpha), 0],
-            [0,               0,             1],
+            [0,              0,             1],
         ])
 
         # Tilt compensation around the leveled camera's X axis
         R_tilt = np.array([
-            [1, 0,              0],
+            [1, 0,              0            ],
             [0, np.cos(theta), -np.sin(theta)],
             [0, np.sin(theta),  np.cos(theta)],
         ])
@@ -522,7 +522,7 @@ class OpticalTrackingNode(Node):
         # Fixed axis remap: leveled camera (x right, y down, z forward)
         # -> robot base (x forward, y left, z up)
         R_remap = np.array([
-            [0, 0, 1],
+            [0,  0, 1],
             [-1, 0, 0],
             [0, -1, 0],
         ])
@@ -535,12 +535,11 @@ class OpticalTrackingNode(Node):
 
         return R
 
-    def transform_position(self, x_cam, y_cam, z_cam, R, t_cam_in_robot):
+    def transform_position_to_robot(self, x_cam, y_cam, z_cam):
         """Transforms a 3D position from the camera frame to the robot base frame."""
         p_cam = np.array([x_cam, y_cam, z_cam])
-        p_robot = R @ p_cam + t_cam_in_robot
+        p_robot = self.R_cam_to_robot @ p_cam + self.camera_offset_in_robot
         return tuple(p_robot)
-
 
     def transform_velocity(self, vx_cam, vy_cam, vz_cam, R):
         """Transforms a 3D velocity from the camera frame to the robot base frame.
@@ -660,6 +659,18 @@ class OpticalTrackingNode(Node):
                     )
                     if self.is_valid_object_position(candidate):
                         object_center_meters = candidate
+
+                if object_center_meters is not None and self.annotations_mode:
+                    x_cam, y_cam, z_cam = object_center_meters
+                    x_robot, y_robot, z_robot = self.transform_position_to_robot(x_cam, y_cam, z_cam)
+
+                    calib_text_cam = f"CAM  x={x_cam:+.2f} y={y_cam:+.2f} z={z_cam:+.2f} m"
+                    calib_text_robot = f"ROBOT x={x_robot:+.2f} y={y_robot:+.2f} z={z_robot:+.2f} m"
+
+                    cv2.putText(annotated_image, calib_text_cam, (x1, y2 + 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+                    cv2.putText(annotated_image, calib_text_robot, (x1, y2 + 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 # Check if the object is held by a person
                 is_held = False

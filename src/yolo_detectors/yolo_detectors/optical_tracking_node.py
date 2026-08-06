@@ -36,6 +36,12 @@ class OpticalTrackingNode(Node):
 
         self.get_logger().info(f"Tracking node configured for target class: '{self.target_class_id}'")
 
+        self.camera_roll_deg          = self.declare_parameter('camera_roll_deg', 90.0).value
+        self.camera_tilt_deg          = self.declare_parameter('camera_tilt_deg', 0.0).value
+        self.camera_offset_in_robot   = np.array(self.declare_parameter('camera_offset_in_robot', [0.0, 0.0, 0.0]).value)
+        # computed once at init, cached (angles are physically fixed after mounting)
+        self.R_cam_to_robot           = self.build_camera_to_robot_rotation(self.camera_roll_deg, self.camera_tilt_deg)
+
         self.tracking_state    = 'IDLE'   # 'IDLE' -> 'HOLDING' -> 'THROWN'
         self.prev_stamp        = None
         self.prev_gray         = None
@@ -418,17 +424,19 @@ class OpticalTrackingNode(Node):
 
         return float(np.median(depth_roi[valid]))
 
-    def pixel_flow_to_velocity(self, vx_px, vy_px, depth_z, depth_estimate, dt):
+    def pixel_flow_to_velocity(self, vx_px, vy_px, depth_prev, depth_curr, dt):
         """
-        Converts a per-frame 2D pixel displacement into a 3D velocity (m/s),
-        using the pinhole camera model at the object's current depth.
+        Converts a per-frame 2D pixel displacement into a 3D velocity (m/s).
+        vx/vy use the depth at the start of the interval (depth_prev) with the
+        pinhole camera model; vz is derived directly from the depth change
+        between the two frames.
         """
-        if depth_z is None or dt <= 0:
+        if depth_prev is None or depth_curr is None or dt <= 0:
             return None
 
-        vx_m = (vx_px * depth_z) / self.fx / dt
-        vy_m = (vy_px * depth_z) / self.fy / dt
-        vz_m = (depth_estimate - self.flow_object_depth_prev) / dt
+        vx_m = (vx_px * depth_prev) / self.fx / dt
+        vy_m = (vy_px * depth_prev) / self.fy / dt
+        vz_m = (depth_curr - depth_prev) / dt
 
         return vx_m, vy_m, vz_m
 
@@ -450,17 +458,21 @@ class OpticalTrackingNode(Node):
 
         vx_px, vy_px = flow_result
 
+        depth_prev = self.flow_object_depth
+
         depth_estimate = self.estimate_object_depth_in_roi(
             cv_depth_image, self.flow_roi, self.flow_arm_mask, self.flow_object_depth
         )
-        if depth_estimate is not None:
-            self.flow_object_depth = depth_estimate
+        depth_curr = depth_estimate if depth_estimate is not None else depth_prev
 
-        velocity = self.pixel_flow_to_velocity(vx_px, vy_px, self.flow_object_depth, depth_estimate, dt)
+        velocity = self.pixel_flow_to_velocity(vx_px, vy_px, depth_prev, depth_curr, dt)
         if velocity is None:
             return
 
-        vx_m, vy_m = velocity
+        vx_m, vy_m, vz_m = velocity
+
+        self.flow_object_depth = depth_curr 
+
         self.get_logger().info(
             f"Optical flow velocity estimate: vx={vx_m:.2f} m/s, vy={vy_m:.2f} m/s, "
             f"depth={self.flow_object_depth:.2f} m"
@@ -482,7 +494,60 @@ class OpticalTrackingNode(Node):
             cv2.putText(annotated_image, "FLOW ROI", (new_x1, new_y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
+    def build_camera_to_robot_rotation(self, roll_deg, tilt_deg):
+        """
+        Builds the rotation matrix from the camera frame (x up, y right, z forward,
+        as physically mounted) to the robot base frame (x forward, y left, z up).
 
+        Composed as: base axis remap -> roll compensation (around camera Z) ->
+        tilt compensation (around leveled camera X).
+        """
+        alpha = np.radians(roll_deg)
+        theta = np.radians(tilt_deg)
+
+        # Roll compensation around the camera's own optical axis (Z_cam)
+        R_roll = np.array([
+            [np.cos(alpha), -np.sin(alpha), 0],
+            [np.sin(alpha),  np.cos(alpha), 0],
+            [0,               0,             1],
+        ])
+
+        # Tilt compensation around the leveled camera's X axis
+        R_tilt = np.array([
+            [1, 0,              0],
+            [0, np.cos(theta), -np.sin(theta)],
+            [0, np.sin(theta),  np.cos(theta)],
+        ])
+
+        # Fixed axis remap: leveled camera (x right, y down, z forward)
+        # -> robot base (x forward, y left, z up)
+        R_remap = np.array([
+            [0, 0, 1],
+            [-1, 0, 0],
+            [0, -1, 0],
+        ])
+
+        R = R_remap @ R_tilt @ R_roll
+
+        # Sanity check: a rotation matrix must be orthogonal (R @ R.T == identity)
+        assert np.allclose(R @ R.T, np.eye(3), atol=1e-6), \
+            "Camera-to-robot rotation matrix is not orthogonal - check angle conventions."
+
+        return R
+
+    def transform_position(self, x_cam, y_cam, z_cam, R, t_cam_in_robot):
+        """Transforms a 3D position from the camera frame to the robot base frame."""
+        p_cam = np.array([x_cam, y_cam, z_cam])
+        p_robot = R @ p_cam + t_cam_in_robot
+        return tuple(p_robot)
+
+
+    def transform_velocity(self, vx_cam, vy_cam, vz_cam, R):
+        """Transforms a 3D velocity from the camera frame to the robot base frame.
+        No translation applied, since velocity is a direction vector, not a position."""
+        v_cam = np.array([vx_cam, vy_cam, vz_cam])
+        v_robot = R @ v_cam
+        return tuple(v_robot)
 
     def synchronized_callback(self, color_msg, depth_msg, yolo_objects, yolo_poses):
         try: 

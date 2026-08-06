@@ -85,10 +85,12 @@ class SpeedDetNode(Node):
         # Predicted trajectory limits
         self.max_predicted_height               = self.declare_parameter('max_predicted_height', 2.0).value
         self.max_predicted_fall                 = self.declare_parameter('max_predicted_fall', -2.0).value
-        self.camera_tilt_deg                    = self.declare_parameter('camera_tilt_deg', 15.0).value
+        self.camera_tilt_deg                    = self.declare_parameter('camera_tilt_deg', 0.0).value
+        self.camera_roll_deg                    = self.declare_parameter('camera_roll_deg', 0.0).value # 0 = landscape (default), 90 or -90 = camera rotated to vertical (requires calibration)
 
-        # Derivated variable
-        self.theta = np.radians(self.camera_tilt_deg)
+        # Derivated variables
+        self.theta_tilt = np.radians(self.camera_tilt_deg)
+        self.alpha_roll = np.radians(self.camera_roll_deg)
 
         ######################################################################
         #                        DATA LOGGING SETUP                          #
@@ -554,11 +556,21 @@ class SpeedDetNode(Node):
 
                 rx_cam, ry_cam, rz_cam = self.smoothed_object_meters
 
-                # Transformation from camera coordinates to world coordinates 
-                # (assuming camera is tilted by theta around the X-axis)
-                rx_world = - rx_cam
-                ry_world = - ry_cam * np.cos(self.theta) + rz_cam * np.sin(self.theta)
-                rz_world = - ry_cam * np.sin(self.theta) + rz_cam * np.cos(self.theta)
+                # Step 1: compensate for the physical roll of the camera around its own
+                # optical axis (Z_cam) - e.g. 90 deg when the camera is mounted vertically
+                # instead of horizontally. This brings the raw camera-optical coordinates
+                # back into the same "landscape" convention (x right, y down, z forward)
+                # that the tilt transform below expects. With camera_roll_deg = 0 this is
+                # a no-op and reduces exactly to the original behaviour.
+                x_lvl = rx_cam * np.cos(self.alpha_roll) - ry_cam * np.sin(self.alpha_roll)
+                y_lvl = rx_cam * np.sin(self.alpha_roll) + ry_cam * np.cos(self.alpha_roll)
+                z_lvl = rz_cam
+ 
+                # Step 2: transformation from the leveled camera frame to world coordinates 
+                # (assuming camera is tilted by theta around its own X-axis)
+                rx_world = - x_lvl
+                ry_world = - y_lvl * np.cos(self.theta_tilt) + z_lvl * np.sin(self.theta_tilt)
+                rz_world = - y_lvl * np.sin(self.theta_tilt) + z_lvl * np.cos(self.theta_tilt)
 
                 current_world_pos = [rx_world, ry_world, rz_world]
 

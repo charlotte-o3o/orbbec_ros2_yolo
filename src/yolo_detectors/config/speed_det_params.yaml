@@ -21,4 +21,5 @@ speed_det_node:
         speed_threshold: 2.0
         startup_grace_period: 8.0
         landing_z_threshold: 0.5
-        camera_tilt_deg: 15.0
+        camera_tilt_deg: 0.0
+        camera_roll_deg: 90.0

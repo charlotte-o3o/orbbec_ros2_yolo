@@ -182,9 +182,7 @@ class OpticalTrackingNode(Node):
 
         return True
 
-    def compute_hand_object_distance_3d(
-        self, obj_center_meters, wx_px, wy_px, cv_depth_image
-    ):
+    def compute_hand_object_distance_3d(self, obj_center_meters, wx_px, wy_px, cv_depth_image):
         """
         Computes the 3D distance between the object and a given wrist.
         """
@@ -245,8 +243,7 @@ class OpticalTrackingNode(Node):
 
         return mask
 
-    def update_throw_detection(self, is_held, holding_arm, object_center_meters,
-                             bbox, wx, wy, cv_depth_image, dt):
+    def update_throw_detection(self, is_held, holding_arm, object_center_meters, bbox, wx, wy, cv_depth_image, dt):
         """
         Manages the transition IDLE -> HOLDING -> THROWN.
         Returns True if this frame marks the start of the throw..
@@ -421,7 +418,7 @@ class OpticalTrackingNode(Node):
 
         return float(np.median(depth_roi[valid]))
 
-    def pixel_flow_to_velocity(self, vx_px, vy_px, depth_z, dt):
+    def pixel_flow_to_velocity(self, vx_px, vy_px, depth_z, depth_estimate, dt):
         """
         Converts a per-frame 2D pixel displacement into a 3D velocity (m/s),
         using the pinhole camera model at the object's current depth.
@@ -431,8 +428,9 @@ class OpticalTrackingNode(Node):
 
         vx_m = (vx_px * depth_z) / self.fx / dt
         vy_m = (vy_px * depth_z) / self.fy / dt
+        vz_m = (depth_estimate - self.flow_object_depth_prev) / dt
 
-        return vx_m, vy_m
+        return vx_m, vy_m, vz_m
 
     def process_thrown_object(self, curr_gray, cv_depth_image, dt, annotated_image):
         """
@@ -458,7 +456,7 @@ class OpticalTrackingNode(Node):
         if depth_estimate is not None:
             self.flow_object_depth = depth_estimate
 
-        velocity = self.pixel_flow_to_velocity(vx_px, vy_px, self.flow_object_depth, dt)
+        velocity = self.pixel_flow_to_velocity(vx_px, vy_px, self.flow_object_depth, depth_estimate, dt)
         if velocity is None:
             return
 

@@ -220,7 +220,7 @@ class SpeedDetNode(Node):
         if not self.has_camera_info:
             self.fx = msg.k[0]
             self.fy = msg.k[4] 
-            self.cx = msg.k[2]     
+            self.cx = msg.k[2]
             self.cy = msg.k[5] 
             self.has_camera_info = True
 
@@ -751,6 +751,7 @@ class SpeedDetNode(Node):
                                     msg_pred.z_landing = float(z_target)
                                     
                                     self.pub_landing.publish(msg_pred)
+                                    self.get_logger().info(f"[PUBLISHED] Sent to topic -> count subscribers: {self.pub_landing.get_subscription_count()}")
                                 else:
                                     self.get_logger().warn("Trajectory prediction active but DOES NOT intersect the 3D capture box!")
 

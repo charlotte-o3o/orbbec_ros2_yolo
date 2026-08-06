@@ -837,9 +837,6 @@ class SpeedDetNode(Node):
                 if self.frame_count % 30 == 0: 
                     self.csv_file.flush()
 
-            # Uncomment the following line if the camera is flipped upside down
-            #display_image = cv2.flip(annotated_image, -1)
-
             # Record annotated video frames if recording mode is enabled
             if self.record_mode:
                 if self.video_writer is None:
@@ -851,16 +848,12 @@ class SpeedDetNode(Node):
                 
                 if self.video_writer is not None:
                     self.video_writer.write(annotated_image)
-                    # Uncomment the following line if the camera is flipped upside down
-                    #self.video_writer.write(display_image)
             
 
             self.frame_count += 1
 
             #cv2.putText(annotated_image, "Press ECHAP to quit", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             cv2.imshow("Throw Detection With Object Speed", annotated_image)
-            # Uncomment the following line if the camera is flipped upside down
-            #cv2.imshow("Throw Detection With Object Speed", display_image)
             
             key = cv2.waitKey(1) & 0xFF
 

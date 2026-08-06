@@ -12,7 +12,7 @@ services:
     # ROS_DOMAIN_ID doit correspondre à celui du wrapper caméra (orbbec_ros2, voir son .env)
     # RMW_IMPLEMENTATION doit aussi matcher : le wrapper force rmw_cyclonedds_cpp (stage "dep")
     environment:
-      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-2}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - DEPLOYMENT_ENV=${DEPLOYMENT_ENV:-local}
       - DISPLAY=${DISPLAY}

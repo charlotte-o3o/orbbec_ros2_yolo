@@ -68,6 +68,29 @@ class OpticalTrackingNode(Node):
         self.flow_arm_mask     = None   # full-frame mask, arm excluded, frozen at release
         self.flow_object_depth = None   # last known object depth (m)
 
+        ######################################################################
+        #                     KALMAN FILTER PARAMETERS                       #
+        ######################################################################
+        # State: [x, y, z, vx, vy, vz]^T (in robot frame)
+        self.kf_x = np.zeros((6, 1))
+        
+        # Covariance matrix (estimation uncertainty)
+        self.kf_P = np.eye(6)
+        
+        # Constant acceleration due to gravity (m/s^2) in the robot frame (z-axis)
+        self.gravity = 9.81 
+        
+        # Process noise matrix Q
+        # Represents the uncertainties of the physical model (wind, friction, spin)
+        # We add a bit more noise to the velocities than to the positions
+        dt_assumed = 1.0 / self.fps_camera
+        q_pos_var = 0.01
+        q_vel_var = 0.1
+        self.kf_Q = np.diag([
+            q_pos_var, q_pos_var, q_pos_var, 
+            q_vel_var, q_vel_var, q_vel_var
+        ])
+
         self.right_wrist_color = (241, 255, 81)
         self.left_wrist_color  = (218, 110, 255)
 
@@ -332,10 +355,9 @@ class OpticalTrackingNode(Node):
         bbox_w = x2 - x1
         bbox_h = y2 - y1
 
-        h_frame, w_frame = self.prev_gray.shape[:2]
-
         # Construction of the ROI
         # We add of a margin to each side of the bbox so that the ROI is larger than it
+        h_frame, w_frame = self.prev_gray.shape[:2]
         margin_x = int(bbox_w * self.roi_margin_ratio)
         margin_y = int(bbox_h * self.roi_margin_ratio)
 
@@ -360,6 +382,34 @@ class OpticalTrackingNode(Node):
         self.get_logger().info(
             f"Initialized optical flow ROI: {self.flow_roi}, "
             f"reference depth: {self.flow_object_depth}"
+        )
+
+        # Kalman filter initialization at the moment of the throw, using the last known position and a zero initial velocity.
+        
+        # Obtain the last known position in the robot frame
+        x_cam, y_cam, z_cam = self.last_valid_object_center_m
+        x_rob, y_rob, z_rob = self.transform_position_to_robot(x_cam, y_cam, z_cam)
+
+        # Initial velocity estimation: we can use the last known optical flow to estimate 
+        # the initial velocity, but for simplicity, we can start with zero and let the first optical flow measurement correct it.
+        vx_init, vy_init, vz_init = 0.0, 0.0, 0.0 
+
+        # Initialize the Kalman filter state vector
+        self.kf_x = np.array([
+            [x_rob],
+            [y_rob],
+            [z_rob],
+            [vx_init],
+            [vy_init],
+            [vz_init]
+        ])
+
+        # Initialize the covariance matrix with small uncertainties for position and larger for velocity
+        self.kf_P = np.diag([0.05, 0.05, 0.05, 5.0, 5.0, 5.0])
+
+        self.get_logger().info(
+            f"Initialized optical flow ROI : {self.flow_roi},"
+            f"and Kalman Filter at Robot pos: ({x_rob:.2f}, {y_rob:.2f}, {z_rob:.2f})"
         )
 
     def compute_optical_flow_in_roi(self, prev_gray, curr_gray, roi, arm_mask=None):
@@ -467,15 +517,37 @@ class OpticalTrackingNode(Node):
 
         velocity = self.pixel_flow_to_velocity(vx_px, vy_px, depth_prev, depth_curr, dt)
         if velocity is None:
+            self.kalman_predict(dt)
             return
 
-        vx_m, vy_m, vz_m = velocity
-
-        self.flow_object_depth = depth_curr 
+        vx_cam_m, vy_cam_m, vz_cam_m = velocity
+        self.flow_object_depth = depth_curr
 
         self.get_logger().info(
-            f"Optical flow velocity estimate: vx={vx_m:.2f} m/s, vy={vy_m:.2f} m/s, "
+            f"Optical flow velocity estimate: vx={vx_cam_m:.2f} m/s, vy={vy_cam_m:.2f} m/s, vz={vz_cam_m:.2f} m/s | "
             f"depth={self.flow_object_depth:.2f} m"
+        )
+
+        # Kalman filter update steps:
+        
+        # Predict the next state based on the elapsed time dt (Ballistic physics)
+        self.kalman_predict(dt)
+
+        # Transform the observed velocity into the robot frame
+        # We use self.R_cam_to_robot and the existing transform_velocity function
+        vx_rob, vy_rob, vz_rob = self.transform_velocity(vx_cam_m, vy_cam_m, vz_cam_m, self.R_cam_to_robot)
+
+        # Update the Kalman filter with the new velocity measurement in the robot frame
+        self.kalman_update_velocity(vx_rob, vy_rob, vz_rob)
+
+        # Extract the smoothed/predicted position for display (Robot frame)
+        kf_x_rob = float(self.kf_x[0])
+        kf_y_rob = float(self.kf_x[1])
+        kf_z_rob = float(self.kf_x[2])
+
+        self.get_logger().info(
+            f"KF Position (Robot): x={kf_x_rob:.2f}, y={kf_y_rob:.2f}, z={kf_z_rob:.2f} | "
+            f"Flow Vel (Robot): vx={vx_rob:.2f}, vy={vy_rob:.2f}, vz={vz_rob:.2f}"
         )
 
         # Naive ROI propagation: shift by the measured pixel flow, same size for now
@@ -547,6 +619,84 @@ class OpticalTrackingNode(Node):
         v_cam = np.array([vx_cam, vy_cam, vz_cam])
         v_robot = R @ v_cam
         return tuple(v_robot)
+
+    def kalman_predict(self, dt):
+            """
+            Predicts the next state of the Kalman filter based on the elapsed time dt (ballistic model).
+            Updates the state kf_x and the covariance kf_P based on the elapsed time dt.
+            """
+            if dt <= 0:
+                return
+
+            # State transition matrix F for constant velocity (6x6)
+            F = np.eye(6)
+            F[0, 3] = dt  # x = x + vx*dt
+            F[1, 4] = dt  # y = y + vy*dt
+            F[2, 5] = dt  # z = z + vz*dt
+
+            # Control input matrix B_u for gravity effect (6x1)
+            # In the robot coordinate system, the positive Z-axis points upwards, while gravity pulls downwards.
+            B_u = np.zeros((6, 1))
+            B_u[2, 0] = -0.5 * self.gravity * (dt ** 2)  # z = z - 1/2 * g * dt^2
+            B_u[5, 0] = -self.gravity * dt               # vz = vz - g * dt
+
+            # Prediction of the state
+            self.kf_x = F @ self.kf_x + B_u
+
+            # Prediction of the covariance
+            self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
+
+    def kalman_update_velocity(self, vx_rob, vy_rob, vz_rob):
+            """
+            Filter correction using a SPEED measurement (derived from optical flow).
+            """
+            # Measurement vector Z (3x1)
+            Z = np.array([[vx_rob], [vy_rob], [vz_rob]])
+
+            # Observation matrix H_vel (3x6): only vx, vy, and vz are observed
+            H_vel = np.zeros((3, 6))
+            H_vel[0, 3] = 1.0
+            H_vel[1, 4] = 1.0
+            H_vel[2, 5] = 1.0
+
+            # Measurement noise matrix R_vel
+            # The optical flow measurement can be noisy, so we assign a moderate uncertainty to it.
+            R_vel = np.eye(3) * 0.5 
+
+            # Kalman filter update equations
+            y = Z - (H_vel @ self.kf_x)                     # Innovation (prediction error)
+            S = H_vel @ self.kf_P @ H_vel.T + R_vel         # Innovation covariance
+            K = self.kf_P @ H_vel.T @ np.linalg.inv(S)      # Kalman gain
+
+            # Update the state and covariance
+            self.kf_x = self.kf_x + (K @ y)
+            self.kf_P = (np.eye(6) - K @ H_vel) @ self.kf_P
+
+    def kalman_update_position(self, x_rob, y_rob, z_rob):
+        """
+        Filter correction using a POSITION measurement (derived from YOLO + Depth).
+        """
+        # Measurement vector Z (3x1)
+        Z = np.array([[x_rob], [y_rob], [z_rob]])
+
+        # Observation matrix H_pos (3x6): only x, y, and z are observed.
+        H_pos = np.zeros((3, 6))
+        H_pos[0, 0] = 1.0
+        H_pos[1, 1] = 1.0
+        H_pos[2, 2] = 1.0
+
+        # Measurement noise matrix R_pos
+        # The YOLO + Depth measurement can be noisy, so we assign a low uncertainty to it.
+        R_pos = np.eye(3) * 0.05 
+
+        # Kalman filter update equations
+        y = Z - (H_pos @ self.kf_x)                     # Innovation (prediction error)
+        S = H_pos @ self.kf_P @ H_pos.T + R_pos         # Innovation covariance
+        K = self.kf_P @ H_pos.T @ np.linalg.inv(S)      # Kalman gain
+
+        # Update the state and covariance
+        self.kf_x = self.kf_x + (K @ y)
+        self.kf_P = (np.eye(6) - K @ H_pos) @ self.kf_P
 
     def synchronized_callback(self, color_msg, depth_msg, yolo_objects, yolo_poses):
         try: 

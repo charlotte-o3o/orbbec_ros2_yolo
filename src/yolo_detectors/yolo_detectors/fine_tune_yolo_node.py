@@ -28,6 +28,11 @@ class FineTuneYoloNode(Node):
         self.declare_parameter('max_jump',    2.0)
         self.declare_parameter('bb_margin',   0.46)
         self.declare_parameter('max_velocity', 5.0)
+        # Counter-clockwise rotation applied to the colour image BEFORE inference, so YOLO
+        # sees an upright scene when the camera is physically mounted rotated. Detections are
+        # mapped straight back to native pixels, so depth sampling, the intrinsics and the
+        # published 3D points are all unaffected by this.
+        self.declare_parameter('input_rotation_deg', 90)
 
         self.model_path           = self.get_parameter('model_path').value
         self.confidence_threshold = self.get_parameter('confidence').value
@@ -35,6 +40,21 @@ class FineTuneYoloNode(Node):
         self.max_jump             = self.get_parameter('max_jump').value
         self.bb_margin            = self.get_parameter('bb_margin').value
         self.max_velocity         = self.get_parameter('max_velocity').value
+        self.input_rotation_deg   = int(self.get_parameter('input_rotation_deg').value) % 360
+
+        # The cv2.rotate flag and the inverse box mapping are both derived from this single
+        # value, so they cannot drift out of sync.
+        _rotate_flags = {
+            0:   None,
+            90:  cv2.ROTATE_90_COUNTERCLOCKWISE,
+            180: cv2.ROTATE_180,
+            270: cv2.ROTATE_90_CLOCKWISE,
+        }
+        if self.input_rotation_deg not in _rotate_flags:
+            raise ValueError(
+                f"input_rotation_deg must be one of 0/90/180/270, got {self.input_rotation_deg}"
+            )
+        self.rotate_flag = _rotate_flags[self.input_rotation_deg]
 
         self.fx = 616.0  # Focal length in pixels (x-axis)
         self.fy = 616.0  # Focal length in pixels (y-axis)
@@ -107,6 +127,35 @@ class FineTuneYoloNode(Node):
 
             self.destroy_subscription(self.sub_info)  # Unsubscribe after receiving camera info
 
+    def unrotate_box(self, x1_up, y1_up, x2_up, y2_up, w_orig, h_orig):
+        """
+        Map a box from the upright (rotated) image back to native colour-image pixels.
+
+        Forward mapping of a native pixel (x, y), per cv2.rotate mode:
+            90  CCW : (x_up, y_up) = (y,              w_orig - 1 - x)
+            180     : (x_up, y_up) = (w_orig - 1 - x, h_orig - 1 - y)
+            270 CCW : (x_up, y_up) = (h_orig - 1 - y, x)
+
+        Below is the inverse applied to both corners; min/max then re-normalises the box,
+        since rotating swaps which corner is top-left.
+        """
+        if self.input_rotation_deg == 0:
+            return x1_up, y1_up, x2_up, y2_up
+
+        if self.input_rotation_deg == 90:
+            corners = [(w_orig - 1 - y1_up, x1_up),
+                       (w_orig - 1 - y2_up, x2_up)]
+        elif self.input_rotation_deg == 180:
+            corners = [(w_orig - 1 - x1_up, h_orig - 1 - y1_up),
+                       (w_orig - 1 - x2_up, h_orig - 1 - y2_up)]
+        else:  # 270
+            corners = [(y1_up, h_orig - 1 - x1_up),
+                       (y2_up, h_orig - 1 - x2_up)]
+
+        xs = [c[0] for c in corners]
+        ys = [c[1] for c in corners]
+        return min(xs), min(ys), max(xs), max(ys)
+
     def synchronized_callback(self, color_msg, depth_msg):
         try:
             cv_color_image = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
@@ -114,15 +163,16 @@ class FineTuneYoloNode(Node):
 
             h_orig, w_orig = cv_color_image.shape[:2]
 
-            # --- 1. REDRESSEMENT DE L'IMAGE POUR YOLO ---
-            # Si ta caméra est physiquement tournée vers la droite (le haut pointe à droite)
-            cv_color_upright = cv2.rotate(cv_color_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            
-            # Note : Si elle est tournée vers la gauche, utilise cv2.ROTATE_90_COUNTERCLOCKWISE
+            # --- 1. Straighten the image for YOLO ---
+            # The models are trained on upright scenes, so a physically rotated camera costs
+            # recall. Rotate for inference only: everything downstream stays native.
+            if self.rotate_flag is None:
+                cv_color_upright = cv_color_image
+            else:
+                cv_color_upright = cv2.rotate(cv_color_image, self.rotate_flag)
 
             start_time = time.perf_counter()
-            # Inférence de YOLO sur l'image redressée
-            results = self.model(cv_color_upright, stream=True, verbose=False, conf=self.confidence_threshold)           
+            results = self.model(cv_color_upright, stream=True, verbose=False, conf=self.confidence_threshold)
             results = list(results)
             end_time = time.perf_counter() 
 
@@ -145,29 +195,14 @@ class FineTuneYoloNode(Node):
                     label = self.model.names[class_id]
                     confidence = float(box.conf[0]) * 100
                     
-                    # --- 2. COORDONNÉES DANS L'IMAGE REDRESSÉE ---
+                    # --- 2. Coordinates in the upright image, as YOLO saw it ---
                     x1_up, y1_up, x2_up, y2_up  = map(int, box.xyxy[0])
 
-                    # --- 3. CONVERSION INVERSE (Vers l'image native couchée) ---
-                    # Formule pour cv2.ROTATE_90_CLOCKWISE :
-                    #x1 = y1_up
-                    #y1 = h_orig - x2_up
-                    #x2 = y2_up
-                    #y2 = h_orig - x1_up
-
-                    # Si tu utilises cv2.ROTATE_90_COUNTERCLOCKWISE, remplace les 4 lignes ci-dessus par :
-                    x1 = w_orig - y2_up
-                    y1 = x1_up
-                    x2 = w_orig - y1_up
-                    y2 = x2_up
-
-                    # Sécurité : forcer x1, y1 comme coin supérieur gauche
-                    x1, x2 = min(x1, x2), max(x1, x2)
-                    y1, y2 = min(y1, y2), max(y1, y2)
-
-                    # --- SUITE DU CODE ORIGINAL ---
-                    # Le reste de tes calculs de profondeur et d'affichage utilise 
-                    # désormais (x1, y1, x2, y2) parfaitement recalés sur l'image native.
+                    # --- 3. Back to native colour-image pixels ---
+                    # From here on (x1, y1, x2, y2) are registered on the native image, so
+                    # depth sampling and deprojection need no further adjustment.
+                    x1, y1, x2, y2 = self.unrotate_box(x1_up, y1_up, x2_up, y2_up,
+                                                       w_orig, h_orig)
 
                     x_center = int((x1 + x2) / 2)
                     y_center = int((y1 + y2) / 2)

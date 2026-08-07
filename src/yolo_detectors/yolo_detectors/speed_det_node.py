@@ -10,7 +10,8 @@ from lancer_interfaces.msg import HumanPoseArray, LandingPrediction
 import message_filters
 from vision_msgs.msg import Detection2DArray
 from cv_bridge import CvBridge
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, Imu
+import tf2_ros
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -85,14 +86,32 @@ class SpeedDetNode(Node):
         # Predicted trajectory limits
         self.max_predicted_height               = self.declare_parameter('max_predicted_height', 2.0).value
         self.max_predicted_fall                 = self.declare_parameter('max_predicted_fall', -2.0).value
+        # Camera orientation.
+        # 'imu'    : derive the world frame from the camera's own gravity vector (default).
+        # 'params' : fall back to the hand-measured angles below.
+        self.orientation_source                 = self.declare_parameter('orientation_source', 'imu').value
         self.camera_tilt_deg                    = self.declare_parameter('camera_tilt_deg', 0.0).value
         self.camera_roll_deg                    = self.declare_parameter('camera_roll_deg', 0.0).value # 0 = landscape (default), 90 or -90 = camera rotated to vertical (requires calibration)
 
-        # Derivated variables
-        self.theta_tilt = np.radians(self.camera_tilt_deg)
-        self.alpha_roll = np.radians(self.camera_roll_deg)
+        # IMU gravity acquisition (only used when orientation_source == 'imu')
+        self.imu_topic                          = self.declare_parameter('imu_topic', '/orbbec_external/gyro_accel/sample').value
+        self.imu_optical_frame                  = self.declare_parameter('imu_optical_frame', 'orbbec_external_color_optical_frame').value
+        self.imu_min_samples                    = self.declare_parameter('imu_min_samples', 20).value
+        self.imu_accel_tolerance                = self.declare_parameter('imu_accel_tolerance', 1.0).value  # m/s^2 around 9.81
+        self.imu_gyro_tolerance                 = self.declare_parameter('imu_gyro_tolerance', 0.05).value  # rad/s, ~0 => camera at rest
 
-        self.effective_gravity                  = self.declare_parameter('effective_gravity', 8.5).value
+        # True gravity. This must stay at 9.81: the world frame is gravity-aligned by
+        # construction, so anything else here is compensating for a geometry bug.
+        self.effective_gravity                  = self.declare_parameter('effective_gravity', 9.81).value
+
+        # Robot capture box, in world-frame metres. Tuned empirically -- exposed here so it
+        # can be re-tuned without rebuilding the image.
+        self.capture_box_x_min                  = self.declare_parameter('capture_box_x_min', -1.0).value
+        self.capture_box_x_max                  = self.declare_parameter('capture_box_x_max',  1.0).value
+        self.capture_box_y_min                  = self.declare_parameter('capture_box_y_min', -1.0).value
+        self.capture_box_y_max                  = self.declare_parameter('capture_box_y_max',  1.0).value
+        self.capture_box_z_min                  = self.declare_parameter('capture_box_z_min',  0.0).value
+        self.capture_box_z_max                  = self.declare_parameter('capture_box_z_max',  0.2).value
 
         ######################################################################
         #                        DATA LOGGING SETUP                          #
@@ -161,7 +180,31 @@ class SpeedDetNode(Node):
         self.predicted_trajectory          = None
         self.trajectory_observed           = []
         self.trajectory_history            = []
-        
+
+        ######################################################################
+        #                     CAMERA -> WORLD ORIENTATION                    #
+        ######################################################################
+
+        # Gravity samples collected during the startup grace period, then frozen.
+        self.imu_gravity_samples           = []
+        self.imu_frame_id                  = ''
+        self.orientation_frozen            = False
+        self.R_cam_to_world                = None
+
+        if self.orientation_source == 'imu':
+            self.tf_buffer   = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+            self.get_logger().info(
+                f"Orientation source: IMU. Collecting gravity from {self.imu_topic} "
+                f"for the {self.startup_grace_period:.1f}s grace period."
+            )
+        else:
+            self.tf_buffer   = None
+            self.tf_listener = None
+            self.R_cam_to_world = self.build_rotation_from_angles(self.camera_roll_deg,
+                                                                  self.camera_tilt_deg)
+            self.orientation_frozen = True
+
         ######################################################################
         #                           PUBLISHERS                               #
         ######################################################################
@@ -207,6 +250,14 @@ class SpeedDetNode(Node):
             '/yolo_detected_poses'
         )
 
+        if self.orientation_source == 'imu':
+            self.sub_imu        = self.create_subscription(
+                Imu,
+                self.imu_topic,
+                self.imu_callback,
+                50
+            )
+
         ######################################################################
         #                          SYNCHRONIZER                              #
         ######################################################################
@@ -231,6 +282,184 @@ class SpeedDetNode(Node):
             self.get_logger().info(f"Camera info received: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
 
             self.destroy_subscription(self.sub_info)  # Unsubscribe after receiving camera info
+
+    ######################################################################
+    #                      CAMERA -> WORLD GEOMETRY                      #
+    ######################################################################
+
+    # Standard ROS body (x fwd, y left, z up) -> optical (x right, y down, z fwd).
+    # Used only if the TF lookup is unavailable; TF is preferred because the Femto Bolt
+    # has a real physical extrinsic between the IMU and the colour sensor.
+    BODY_TO_OPTICAL = np.array([[0.0, -1.0,  0.0],
+                                [0.0,  0.0, -1.0],
+                                [1.0,  0.0,  0.0]])
+
+    def imu_callback(self, msg: Imu):
+        """
+        Collect gravity samples during the startup grace period.
+
+        Imu.linear_acceleration is SPECIFIC FORCE, not gravity-removed acceleration: a
+        stationary sensor reads ~ +9.81 m/s^2 along its up axis. That is exactly the vector
+        we want, provided the camera is actually at rest -- which is what the gyro on this
+        same synchronised message lets us verify.
+        """
+        if self.orientation_frozen:
+            return
+
+        a = np.array([msg.linear_acceleration.x,
+                      msg.linear_acceleration.y,
+                      msg.linear_acceleration.z])
+        w = np.array([msg.angular_velocity.x,
+                      msg.angular_velocity.y,
+                      msg.angular_velocity.z])
+
+        # Reject anything that is not a pure gravity reading.
+        if abs(np.linalg.norm(a) - 9.81) > self.imu_accel_tolerance:
+            return
+        if np.linalg.norm(w) > self.imu_gyro_tolerance:
+            return
+
+        self.imu_frame_id = msg.header.frame_id
+        self.imu_gravity_samples.append(a)
+
+    def get_body_to_optical(self):
+        """Rotation from the IMU body frame to the colour optical frame, via TF if possible."""
+        if self.tf_buffer is not None:
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.imu_optical_frame, self.imu_frame_id, rclpy.time.Time()
+                )
+                q = tf.transform.rotation
+                return self.quaternion_to_matrix(q.x, q.y, q.z, q.w)
+            except Exception as e:
+                self.get_logger().warn(
+                    f"TF {self.imu_frame_id} -> {self.imu_optical_frame} unavailable ({e}); "
+                    f"falling back to the standard ROS body->optical rotation."
+                )
+        return self.BODY_TO_OPTICAL
+
+    @staticmethod
+    def quaternion_to_matrix(x, y, z, w):
+        n = np.sqrt(x*x + y*y + z*z + w*w)
+        x, y, z, w = x/n, y/n, z/n, w/n
+        return np.array([
+            [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
+            [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
+            [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)],
+        ])
+
+    def build_rotation_from_gravity(self, gravity_optical):
+        """
+        Build the camera-optical -> world rotation from a measured gravity vector.
+
+        World convention (unchanged from the original pipeline): x left, y UP, z forward.
+        Gravity fixes only 2 of the 3 DOF; the remaining yaw is taken from the camera's own
+        optical +Z levelled onto the horizontal plane, so world Z keeps meaning "where the
+        camera looks, horizontally". That preserves the semantics of the vz < 0 approach
+        test and of the capture box's Z range.
+
+        Gram-Schmidt guarantees orthonormality by construction, which is what makes the
+        previous failure mode (a sheared, non-orthogonal matrix) unrepresentable here.
+        """
+        up = -gravity_optical / np.linalg.norm(gravity_optical)
+
+        fwd = np.array([0.0, 0.0, 1.0])          # optical +Z
+        if abs(np.dot(fwd, up)) > 0.99:
+            # Camera looking almost straight up or down: optical +Z is useless as a yaw
+            # reference, so use image-up instead.
+            fwd = np.array([0.0, -1.0, 0.0])
+
+        Z_w = fwd - np.dot(fwd, up) * up
+        Z_w = Z_w / np.linalg.norm(Z_w)
+        Y_w = up
+        X_w = np.cross(Y_w, Z_w)
+
+        R = np.array([X_w, Y_w, Z_w])
+        self.validate_rotation(R, "gravity-derived")
+        return R
+
+    def build_rotation_from_angles(self, roll_deg, tilt_deg):
+        """
+        Fallback: camera-optical -> world from hand-measured angles.
+
+            R = R_x(tilt) @ diag(-1,-1,1) @ R_z(roll)
+
+        R_z undoes the physical roll about the optical axis, diag(-1,-1,1) flips the optical
+        "y down" convention to world "y up", R_x undoes the pitch.
+
+        The previous hand-expanded form of this was NOT a rotation: it had det = cos(2*tilt)
+        and a 2*tilt shear between the world Y and Z axes, which under-read vertical motion
+        and leaked approach velocity into a phantom downward component.
+        """
+        alpha = np.radians(roll_deg)
+        theta = np.radians(tilt_deg)
+
+        R_roll = np.array([[np.cos(alpha), -np.sin(alpha), 0.0],
+                           [np.sin(alpha),  np.cos(alpha), 0.0],
+                           [0.0,            0.0,           1.0]])
+
+        R_flip = np.diag([-1.0, -1.0, 1.0])
+
+        R_tilt = np.array([[1.0, 0.0,            0.0           ],
+                           [0.0, np.cos(theta), -np.sin(theta)],
+                           [0.0, np.sin(theta),  np.cos(theta)]])
+
+        R = R_tilt @ R_flip @ R_roll
+        self.validate_rotation(R, f"angle-derived (roll={roll_deg}, tilt={tilt_deg})")
+        return R
+
+    def validate_rotation(self, R, label):
+        """Fail loudly rather than silently skewing every trajectory."""
+        if not np.allclose(R @ R.T, np.eye(3), atol=1e-6) or not np.isclose(np.linalg.det(R), 1.0, atol=1e-6):
+            raise ValueError(
+                f"{label} camera->world matrix is not a proper rotation "
+                f"(det={np.linalg.det(R):.6f}, orthogonality error="
+                f"{np.abs(R @ R.T - np.eye(3)).max():.6f})"
+            )
+
+    def finalize_orientation(self):
+        """
+        Called once when the startup grace period ends: average the collected gravity
+        samples, build the world rotation, and freeze it for the rest of the session.
+        """
+        if self.orientation_frozen:
+            return
+
+        if len(self.imu_gravity_samples) < self.imu_min_samples:
+            self.get_logger().warn(
+                f"Only {len(self.imu_gravity_samples)} valid IMU gravity samples "
+                f"(need {self.imu_min_samples}) -- falling back to camera_roll_deg="
+                f"{self.camera_roll_deg} / camera_tilt_deg={self.camera_tilt_deg}."
+            )
+            self.R_cam_to_world = self.build_rotation_from_angles(self.camera_roll_deg,
+                                                                  self.camera_tilt_deg)
+            self.orientation_frozen = True
+            return
+
+        g_body = np.mean(np.array(self.imu_gravity_samples), axis=0)
+        R_body_to_optical = self.get_body_to_optical()
+        g_optical = R_body_to_optical @ g_body
+
+        self.R_cam_to_world = self.build_rotation_from_gravity(g_optical)
+        self.orientation_frozen = True
+
+        # Report the equivalent mounting angles so the result can be sanity-checked against
+        # the physical setup (expected here: roll ~ -90, tilt ~ 30).
+        # Inverting R = R_x(tilt) @ diag(-1,-1,1) @ R_z(roll), whose first row is
+        # (-cos(roll), sin(roll), 0) and whose R[1][2] is -sin(tilt). Note the minus on
+        # R[0][0]: without it the roll is right only at +/-90 and wrong elsewhere.
+        R = self.R_cam_to_world
+        tilt_equiv = np.degrees(np.arcsin(np.clip(-R[1, 2], -1.0, 1.0)))
+        roll_equiv = np.degrees(np.arctan2(R[0, 1], -R[0, 0]))
+
+        self.get_logger().info(
+            f"World frame fixed from {len(self.imu_gravity_samples)} IMU samples | "
+            f"gravity(body)=({g_body[0]:+.2f},{g_body[1]:+.2f},{g_body[2]:+.2f}) "
+            f"|g|={np.linalg.norm(g_body):.2f} | "
+            f"equivalent roll={roll_equiv:+.1f} deg, tilt={tilt_equiv:+.1f} deg"
+        )
+
+        self.destroy_subscription(self.sub_imu)
 
     def is_valid_object_position(self, position_meters):
         """
@@ -419,13 +648,12 @@ class SpeedDetNode(Node):
         x0, y0, z0 = pos_0
         vx, vy, vz = vel_0
 
-        # Definition of the robot's capture box (in meters, in the camera's reference frame)
-        """X_MIN, X_MAX = -0.25, -0.11   
-        Y_MIN, Y_MAX = -0.09, 0.21   
-        Z_MIN, Z_MAX =  0.0, 0.17"""   
-        X_MIN, X_MAX = -1.0, 1.0
-        Y_MIN, Y_MAX = -1, 1
-        Z_MIN, Z_MAX =  0.0, 0.2
+        # Definition of the robot's capture box, in metres in the world frame.
+        # Configurable via capture_box_* -- these were tuned against the old (sheared)
+        # world frame, so expect to re-tune them now that the geometry is corrected.
+        X_MIN, X_MAX = self.capture_box_x_min, self.capture_box_x_max
+        Y_MIN, Y_MAX = self.capture_box_y_min, self.capture_box_y_max
+        Z_MIN, Z_MAX = self.capture_box_z_min, self.capture_box_z_max
 
         # Sampling of the future of the parabola (e.g., over 1.5 seconds with a step of 10ms)
         time_steps = np.linspace(0.01, 1.5, 150)
@@ -555,7 +783,20 @@ class SpeedDetNode(Node):
                 cv2.putText(annotated_image, f"WARMING UP ({remaining_time:.1f}s)", (30, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 165, 255), 3)
 
-            if object_center_meters is not None and None not in object_center_meters:
+            # The grace period doubles as the IMU gravity acquisition window: once it ends,
+            # average the samples into the world rotation and freeze it for the session.
+            if remaining_time <= 0 and not self.orientation_frozen:
+                self.finalize_orientation()
+
+            # Defined up-front so the CSV block below cannot raise NameError on frames where
+            # no object was tracked (e.g. during warm-up, or when the detection is dropped).
+            rx = ry = rz = None
+            rx_world = ry_world = rz_world = None
+
+            # R_cam_to_world stays None until the IMU gravity window closes, so world-frame
+            # tracking simply does not run during warm-up (annotation/recording still do).
+            if (object_center_meters is not None and None not in object_center_meters
+                    and self.R_cam_to_world is not None):
                 rx, ry, rz = object_center_meters
                 object_speed_m_s = 0.0
                 vrx, vry, vrz = 0.0, 0.0, 0.0
@@ -571,21 +812,9 @@ class SpeedDetNode(Node):
 
                 rx_cam, ry_cam, rz_cam = self.smoothed_object_meters
 
-                # Step 1: compensate for the physical roll of the camera around its own
-                # optical axis (Z_cam) - e.g. 90 deg when the camera is mounted vertically
-                # instead of horizontally. This brings the raw camera-optical coordinates
-                # back into the same "landscape" convention (x right, y down, z forward)
-                # that the tilt transform below expects. With camera_roll_deg = 0 this is
-                # a no-op and reduces exactly to the original behaviour.
-                x_lvl = rx_cam * np.cos(self.alpha_roll) - ry_cam * np.sin(self.alpha_roll)
-                y_lvl = rx_cam * np.sin(self.alpha_roll) + ry_cam * np.cos(self.alpha_roll)
-                z_lvl = rz_cam
- 
-                # Step 2: transformation from the leveled camera frame to world coordinates 
-                # (assuming camera is tilted by theta around its own X-axis)
-                rx_world = - x_lvl
-                ry_world = - y_lvl * np.cos(self.theta_tilt) + z_lvl * np.sin(self.theta_tilt)
-                rz_world = - y_lvl * np.sin(self.theta_tilt) + z_lvl * np.cos(self.theta_tilt)
+                # Camera optical frame -> gravity-aligned world frame (x left, y up, z fwd)
+                # in a single orthonormal rotation. See build_rotation_from_gravity().
+                rx_world, ry_world, rz_world = self.R_cam_to_world @ np.array([rx_cam, ry_cam, rz_cam])
 
                 current_world_pos = [rx_world, ry_world, rz_world]
 
@@ -845,9 +1074,9 @@ class SpeedDetNode(Node):
 
             # Write 3D trajectory and tracking status to CSV file if distance logging mode is enabled
             if self.save_distance_mode:        
-                x_csv = round(rx_world, 4) if rx is not None else ""
-                y_csv = round(ry_world, 4) if ry is not None else ""
-                z_csv = round(rz_world, 4) if rz is not None else ""
+                x_csv = round(rx_world, 4) if rx_world is not None else ""
+                y_csv = round(ry_world, 4) if ry_world is not None else ""
+                z_csv = round(rz_world, 4) if rz_world is not None else ""
                 self.csv_writer.writerow([self.frame_count, round(current_timestamp, 4), x_csv, y_csv, z_csv, object_speed_csv, self.throw_detected])
                 if self.frame_count % 30 == 0: 
                     self.csv_file.flush()

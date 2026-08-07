@@ -29,7 +29,7 @@ WORKDIR ${ROS_WS}
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install -r requirements.txt \
-    --extra-index-url https://download.pytorch.org/whl/cu118
+    --extra-index-url https://download.pytorch.org/whl/cu128
 
 # Copy workspace source files and configuration
 COPY src ./src

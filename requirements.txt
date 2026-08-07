@@ -3,10 +3,11 @@ numpy==1.26.4
 opencv-python==4.11.0.86
 matplotlib==3.10.9
 
-# PyTorch CUDA 11.8 (à installer avec --extra-index-url https://download.pytorch.org/whl/cu118)
-torch==2.1.0+cu118
-torchvision==0.16.0+cu118
-torchaudio==2.1.0+cu118
+# PyTorch CUDA 12.8 (à installer avec --extra-index-url https://download.pytorch.org/whl/cu128)
+# cu128 est le premier build embarquant les kernels sm_120 (GPU Blackwell, ex. RTX PRO 3000).
+# Les roues cu118 ne vont que jusqu'à sm_90 -> "no kernel image is available for execution on the device".
+torch==2.9.1+cu128
+torchvision==0.24.1+cu128
 
 ultralytics==8.4.56
 ultralytics-thop==2.0.20

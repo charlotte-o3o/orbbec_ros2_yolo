@@ -27,6 +27,7 @@ cyclonedds_host.xml
 *.db
 .env
 setup_env.sh
+yolo_world_params.yaml
 
 
 # Build directories

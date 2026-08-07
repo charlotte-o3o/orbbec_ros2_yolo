@@ -14,12 +14,13 @@ yolo_pose_node:
 speed_det_node:
     ros__parameters:
         save_distance_mode: false
-        record_mode: true
+        record_mode: True
         annotations_mode: true
         alpha_smooth: 0.4
         cooldown_duration: 5.0
-        speed_threshold: 2.0
+        speed_threshold: 1.5
         startup_grace_period: 8.0
-        landing_z_threshold: 0.5
-        camera_tilt_deg: 0.0
-        camera_roll_deg: 90.0
+        landing_z_threshold: 0.3
+        camera_tilt_deg: 15.0
+        camera_roll_deg: -90.0
+        effective_gravity: 8.0

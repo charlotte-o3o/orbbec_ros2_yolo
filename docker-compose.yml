@@ -31,6 +31,7 @@ services:
     volumes:
       - ./src:/ros2_orbbec_ws/src
       - ./weights:/ros2_orbbec_ws/weights
+      - ./data:/root/ros2_orbbec_ws/data
       - /tmp/.docker.xauth:/tmp/.docker.xauth:ro
       - /tmp/.X11-unix:/tmp/.X11-unix
 

@@ -112,18 +112,28 @@ class FineTuneYoloNode(Node):
             cv_color_image = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
             cv_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
 
+            h_orig, w_orig = cv_color_image.shape[:2]
+
+            # --- 1. REDRESSEMENT DE L'IMAGE POUR YOLO ---
+            # Si ta caméra est physiquement tournée vers la droite (le haut pointe à droite)
+            cv_color_upright = cv2.rotate(cv_color_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            
+            # Note : Si elle est tournée vers la gauche, utilise cv2.ROTATE_90_COUNTERCLOCKWISE
+
             start_time = time.perf_counter()
-            results = self.model(cv_color_image, stream=True, verbose=False, conf=self.confidence_threshold)           
+            # Inférence de YOLO sur l'image redressée
+            results = self.model(cv_color_upright, stream=True, verbose=False, conf=self.confidence_threshold)           
             results = list(results)
             end_time = time.perf_counter() 
 
             inference_time = (end_time - start_time) * 1000
             fps = 1000.0 / inference_time if inference_time > 0 else 0.0
 
+            # L'annotation s'effectue toujours sur l'image native (couchée)
             annotated_image = cv_color_image.copy()
             boxes = results[0].boxes
 
-            # --- Hauteur et largeur de l'image de profondeur pour éviter les débordements de pixels
+            # Hauteur et largeur de l'image de profondeur native
             h, w = cv_depth_image.shape[:2]
 
             msg_array = Detection2DArray()
@@ -134,17 +144,36 @@ class FineTuneYoloNode(Node):
                     class_id = int(box.cls[0])
                     label = self.model.names[class_id]
                     confidence = float(box.conf[0]) * 100
-                    x1, y1, x2, y2  = map(int, box.xyxy[0])
+                    
+                    # --- 2. COORDONNÉES DANS L'IMAGE REDRESSÉE ---
+                    x1_up, y1_up, x2_up, y2_up  = map(int, box.xyxy[0])
+
+                    # --- 3. CONVERSION INVERSE (Vers l'image native couchée) ---
+                    # Formule pour cv2.ROTATE_90_CLOCKWISE :
+                    #x1 = y1_up
+                    #y1 = h_orig - x2_up
+                    #x2 = y2_up
+                    #y2 = h_orig - x1_up
+
+                    # Si tu utilises cv2.ROTATE_90_COUNTERCLOCKWISE, remplace les 4 lignes ci-dessus par :
+                    x1 = w_orig - y2_up
+                    y1 = x1_up
+                    x2 = w_orig - y1_up
+                    y2 = x2_up
+
+                    # Sécurité : forcer x1, y1 comme coin supérieur gauche
+                    x1, x2 = min(x1, x2), max(x1, x2)
+                    y1, y2 = min(y1, y2), max(y1, y2)
+
+                    # --- SUITE DU CODE ORIGINAL ---
+                    # Le reste de tes calculs de profondeur et d'affichage utilise 
+                    # désormais (x1, y1, x2, y2) parfaitement recalés sur l'image native.
 
                     x_center = int((x1 + x2) / 2)
                     y_center = int((y1 + y2) / 2)
                     x_center = max(0, min(x_center, w - 1))
                     y_center = max(0, min(y_center, h - 1))
 
-                    #distance_mm = cv_depth_image[y_center, x_center]
-
-                    # --- Valeur max pour la marge : 0.5 => pixel central uniquement
-                    # --- 0.375 => 25% de la BB d'origine
                     margin_x = int((x2 - x1) * self.bb_margin)                         
                     margin_y = int((y2 - y1) * self.bb_margin)     
 
@@ -169,7 +198,7 @@ class FineTuneYoloNode(Node):
                         distance = 0.0  
 
                     current_time = self.get_clock().now()
-                    dt = (current_time - self.last_valid_time).nanoseconds / 1e9  # Temps écoulé en secondes
+                    dt = (current_time - self.last_valid_time).nanoseconds / 1e9
                     dynamic_max_jump = max(0.20, self.max_velocity * dt)
 
                     if distance > 0 and len(self.distance_history) > 0:
@@ -182,7 +211,6 @@ class FineTuneYoloNode(Node):
                                 self.consecutive_jumps = 0
                             else:
                                 distance = self.distance_history[-1]  
-
                         else:
                             self.consecutive_jumps = 0  
                             self.last_valid_time = current_time
@@ -193,10 +221,8 @@ class FineTuneYoloNode(Node):
                         if len(self.distance_history) > self.max_history:                       
                             self.distance_history.pop(0)  
 
-                        #print(f"Dist. history : {self.distance_history}")
                         distance = float(np.mean(self.distance_history)) 
                    
-
                     if distance > 0:
                         x_meters = ((x_center - self.cx) * distance) / self.fx
                         y_meters = ((y_center - self.cy) * distance) / self.fy
@@ -211,13 +237,12 @@ class FineTuneYoloNode(Node):
                     detection.bbox.size_x = float(x2 - x1)
                     detection.bbox.size_y = float(y2 - y1)
 
-                    hyp = ObjectHypothesisWithPose() # Hypothèse sur l'objet détecté et sa distance dans l'id de la pose
-                    hyp.hypothesis.class_id = str(label) # Nom ou id de l'objet (alien plushie)
-                    hyp.hypothesis.score = confidence / 100.0  # Confiance de la détection (0.0 à 1.0)
+                    hyp = ObjectHypothesisWithPose() 
+                    hyp.hypothesis.class_id = str(label) 
+                    hyp.hypothesis.score = confidence / 100.0  
                     hyp.pose.pose.position.x = float(x_meters) if x_meters is not None else 0.0
                     hyp.pose.pose.position.y = float(y_meters) if y_meters is not None else 0.0
-                    hyp.pose.pose.position.z = float(distance)  # Distance en mètres dans la coord z de la pose
-
+                    hyp.pose.pose.position.z = float(distance)  
                     
                     msg_array.detections.append(detection)
                     detection.results.append(hyp)
@@ -249,15 +274,10 @@ class FineTuneYoloNode(Node):
                 1, 
                 (0, 0, 255), 
                 2
-                )
+            )
             
+            # Optionnel : Tu peux décommenter ces lignes pour vérifier visuellement le résultat
             cv2.imshow("BGR Image with YOLO", annotated_image)
-
-            depth_vis = cv2.normalize(cv_depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-            depth_colormap = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-            
-            #cv2.imshow("Depth Image (sync)", depth_colormap)
-
             cv2.waitKey(1)
 
         except Exception as e:

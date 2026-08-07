@@ -55,13 +55,13 @@ class SpeedDetNode(Node):
 
         # Operating modes (Toggles / Flags)
         self.save_distance_mode                 = self.declare_parameter('save_distance_mode', False).value
-        self.record_mode                        = self.declare_parameter('record_mode', False).value
+        self.record_mode                        = self.declare_parameter('record_mode', True).value
         self.annotations_mode                   = self.declare_parameter('annotations_mode', True).value
 
         # Throw detection parameters
         self.alpha_smooth                       = self.declare_parameter('alpha_smooth', 0.4).value
         self.cooldown_duration                  = self.declare_parameter('cooldown_duration', 8.0).value
-        self.max_false_frames_allowed           = self.declare_parameter('max_false_frames_allowed', 10).value
+        self.max_false_frames_allowed           = self.declare_parameter('max_false_frames_allowed', 30).value
         self.trajectory_tracking_duration       = self.declare_parameter('trajectory_tracking_duration', 3.0).value
         self.history_sampling_interval          = self.declare_parameter('history_sampling_interval', 0.10).value
         self.speed_threshold                    = self.declare_parameter('speed_threshold', 2.0).value
@@ -78,7 +78,7 @@ class SpeedDetNode(Node):
         self.non_approaching_velocity_threshold = self.declare_parameter('non_approaching_velocity_threshold', -0.05).value
 
         # Landing detection
-        self.landing_z_threshold                = self.declare_parameter('landing_z_threshold', 0.5).value
+        self.landing_z_threshold                = self.declare_parameter('landing_z_threshold', 0.3).value
         self.min_time_before_landing_check      = self.declare_parameter('min_time_before_landing_check', 0.15).value
         self.landing_confirm_frames             = self.declare_parameter('landing_confirm_frames', 3).value
 
@@ -91,6 +91,8 @@ class SpeedDetNode(Node):
         # Derivated variables
         self.theta_tilt = np.radians(self.camera_tilt_deg)
         self.alpha_roll = np.radians(self.camera_roll_deg)
+
+        self.effective_gravity                  = self.declare_parameter('effective_gravity', 8.5).value
 
         ######################################################################
         #                        DATA LOGGING SETUP                          #
@@ -260,20 +262,19 @@ class SpeedDetNode(Node):
         """
         Computes the smoothed predictive future trajectory using least squares polynomial fitting (polyfit)
         from the list of historical observed points.
-
-        Returns:
-            - raw_trajectory (list or None): Predicted future points [(t, x, y, z), ...]
-            - vx_moy (float): Estimated average velocity along X
-            - vy_moy (float): Estimated average velocity along Y at t_since_start
-            - vz_moy (float): Estimated average velocity along Z
         """
-        if len(self.trajectory_observed) < 3:
+        # --- NEW: Sliding window implementation ---
+        # Only use the last N points (e.g., 5 to 8) to avoid launch noise
+        WINDOW_SIZE = 6
+        active_points = self.trajectory_observed[-WINDOW_SIZE:]
+
+        if len(active_points) < 3:
             return None, 0.0, 0.0, 0.0
 
-        ts = np.array([p[0] for p in self.trajectory_observed])
-        xs = np.array([p[1] for p in self.trajectory_observed])
-        ys = np.array([p[2] for p in self.trajectory_observed])
-        zs = np.array([p[3] for p in self.trajectory_observed])
+        ts = np.array([p[0] for p in active_points])
+        xs = np.array([p[1] for p in active_points])
+        ys = np.array([p[2] for p in active_points])
+        zs = np.array([p[3] for p in active_points])
 
         # Linear regression (degree 1) for X and Z (constant velocity)
         poly_x = np.polyfit(ts, xs, 1) 
@@ -312,6 +313,20 @@ class SpeedDetNode(Node):
                 break
 
             t_future += dt_frame
+
+        # Sanity check: if the last predicted point is too far below the camera, reject the trajectory (cliff effect)
+        if raw_trajectory:
+            last_point = raw_trajectory[-1]
+            last_y = last_point[2]
+            last_z = last_point[3]
+
+            if last_y <= self.max_predicted_fall and last_z > (self.landing_z_threshold + 0.5):
+                self.get_logger().warn(
+                    f"Trajectory prediction rejected (cliff effect): object hit the floor at Z={last_z:.2f}m "
+                    f"instead of reaching the camera | estimated vz: {vz_moy:.3f} m/s"
+                )
+                # Return None for the trajectory but still provide the estimated velocities for logging
+                return None, vx_moy, vy_moy, vz_moy
 
         return raw_trajectory, vx_moy, vy_moy, vz_moy
 
@@ -408,7 +423,7 @@ class SpeedDetNode(Node):
         """X_MIN, X_MAX = -0.25, -0.11   
         Y_MIN, Y_MAX = -0.09, 0.21   
         Z_MIN, Z_MAX =  0.0, 0.17"""   
-        X_MIN, X_MAX = -0.40, 0
+        X_MIN, X_MAX = -1.0, 1.0
         Y_MIN, Y_MAX = -1, 1
         Z_MIN, Z_MAX =  0.0, 0.2
 
@@ -718,7 +733,7 @@ class SpeedDetNode(Node):
                         if len(self.trajectory_observed) >= 4 and len(self.trajectory_observed) % 2 == 0:
                            
                             dt_frame = dt if dt is not None else (1.0 / self.fps_camera)
-                            raw_trajectory, vx_moy, vy_moy, vz_moy = self.predict_smoothed_trajectory(t_since_start, dt_frame)
+                            raw_trajectory, vx_moy, vy_moy, vz_moy = self.predict_smoothed_trajectory(t_since_start, dt_frame, g_const=self.effective_gravity)
 
                             if raw_trajectory is None:
                                 # If prediction fails due to non-approaching velocity, 

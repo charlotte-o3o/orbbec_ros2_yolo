@@ -127,19 +127,26 @@ class YoloWorldNode(Node):
             cv_color_image = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
             cv_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
 
+            # 1. Récupération des dimensions d'origine
+            h_orig, w_orig = cv_color_image.shape[:2]
+
+            # 2. Rotation à 90° (Sens Horaire / ROTATE_90_CLOCKWISE)
+            # Change selon ton montage : cv2.ROTATE_90_CLOCKWISE ou cv2.ROTATE_90_COUNTERCLOCKWISE
+            rot_code = cv2.ROTATE_90_COUNTERCLOCKWISE 
+            cv_color_rot = cv2.rotate(cv_color_image, rot_code)
+            cv_depth_rot = cv2.rotate(cv_depth_image, rot_code)
+
             start_time = time.perf_counter()
-            results = self.model(cv_color_image, stream=True, verbose=False, conf=self.confidence_threshold)           
+            # Inférence YOLO sur l'image pivotée
+            results = self.model(cv_color_rot, stream=True, verbose=False, conf=self.confidence_threshold)           
             results = list(results)
             end_time = time.perf_counter() 
 
             inference_time = (end_time - start_time) * 1000
             fps = 1000.0 / inference_time if inference_time > 0 else 0.0
 
-            annotated_image = cv_color_image.copy()
+            annotated_image = cv_color_image.copy()  # On annote sur l'image d'origine
             boxes = results[0].boxes
-
-            # Hauteur et largeur de l'image de profondeur pour éviter les débordements de pixels
-            h, w = cv_depth_image.shape[:2]
 
             msg_array = Detection2DArray()
             msg_array.header = color_msg.header
@@ -149,126 +156,119 @@ class YoloWorldNode(Node):
                     class_id = int(box.cls[0])
                     label = self.model.names[class_id]
                     confidence = float(box.conf[0]) * 100
-                    x1, y1, x2, y2  = map(int, box.xyxy[0])
+                    
+                    # Coordonnées dans l'image pivotée (ROTATED)
+                    x1_r, y1_r, x2_r, y2_r = map(int, box.xyxy[0])
+                    x_center_r = int((x1_r + x2_r) / 2)
+                    y_center_r = int((y1_r + y2_r) / 2)
 
-                    x_center = int((x1 + x2) / 2)
-                    y_center = int((y1 + y2) / 2)
-                    x_center = max(0, min(x_center, w - 1))
-                    y_center = max(0, min(y_center, h - 1))
+                    # --- Extraction de la profondeur sur la carte de profondeur pivotée ---
+                    margin_x = int((x2_r - x1_r) * self.bb_margin)                         
+                    margin_y = int((y2_r - y1_r) * self.bb_margin)     
 
-                    #distance_mm = cv_depth_image[y_center, x_center]
+                    y1_p = max(0, y1_r + margin_y)  
+                    y2_p = min(cv_depth_rot.shape[0], y2_r - margin_y)    
+                    x1_p = max(0, x1_r + margin_x)                             
+                    x2_p = min(cv_depth_rot.shape[1], x2_r - margin_x)
 
-                    margin_x = int((x2 - x1) * self.bb_margin)                         
-                    margin_y = int((y2 - y1) * self.bb_margin)     
-
-                    y1_p = max(0, y1 + margin_y)  
-                    y2_p = min(cv_depth_image.shape[0], y2 - margin_y)    
-                    x1_p = max(0, x1 + margin_x)                             
-                    x2_p = min(cv_depth_image.shape[1], x2 - margin_x)
-
-                    patch = cv_depth_image[y1_p:y2_p, x1_p:x2_p]                 
+                    patch = cv_depth_rot[y1_p:y2_p, x1_p:x2_p]                 
                     valid = patch[patch > 0]
 
                     if len(valid) > 0:   
                         median_val = float(np.median(valid))
                         std_val = float(np.std(valid))
                         filtered = valid[np.abs(valid - median_val) < std_val] 
-
-                        if len(filtered) > 0:                              
-                            distance = float(np.median(filtered)) / 1000.0
-                        else:
-                            distance = median_val / 1000.0 
+                        distance = float(np.median(filtered)) / 1000.0 if len(filtered) > 0 else median_val / 1000.0
                     else:                                                              
                         distance = 0.0  
 
+                    # Filtre temporel de Z
                     current_time = self.get_clock().now()
-                    dt = (current_time - self.last_valid_time).nanoseconds / 1e9  # Temps écoulé en secondes
+                    dt = (current_time - self.last_valid_time).nanoseconds / 1e9
                     dynamic_max_jump = max(0.20, self.max_velocity * dt)
 
                     if distance > 0 and len(self.distance_history) > 0:
                         if abs(distance - self.distance_history[-1]) > dynamic_max_jump:
                             self.consecutive_jumps += 1
-
                             if self.consecutive_jumps > 5:
-                                self.get_logger().warn("Blocked Z-filter detected! Resetting history.")
                                 self.distance_history.clear()
                                 self.consecutive_jumps = 0
                             else:
                                 distance = self.distance_history[-1]  
-
                         else:
                             self.consecutive_jumps = 0  
                             self.last_valid_time = current_time
 
                     if distance > 0:                              
                         self.distance_history.append(distance)   
-
                         if len(self.distance_history) > self.max_history:                       
                             self.distance_history.pop(0)  
-
-                        #print(f"Dist. history : {self.distance_history}")
                         distance = float(np.mean(self.distance_history)) 
 
+                    # 3. Remapping des coordonnées vers le repère d'origine (ORIGINAL)
+                    if rot_code == cv2.ROTATE_90_CLOCKWISE:
+                        x_center_orig = y_center_r
+                        y_center_orig = h_orig - 1 - x_center_r
+                        size_x_orig = float(y2_r - y1_r)
+                        size_y_orig = float(x2_r - x1_r)
+                        
+                        x1_orig = y1_r
+                        y1_orig = h_orig - 1 - x2_r
+                        x2_orig = y2_r
+                        y2_orig = h_orig - 1 - x1_r
+                    elif rot_code == cv2.ROTATE_90_COUNTERCLOCKWISE:
+                        x_center_orig = w_orig - 1 - y_center_r
+                        y_center_orig = x_center_r
+                        size_x_orig = float(y2_r - y1_r)
+                        size_y_orig = float(x2_r - x1_r)
+
+                        x1_orig = w_orig - 1 - y2_r
+                        y1_orig = x1_r
+                        x2_orig = w_orig - 1 - y1_r
+                        y2_orig = x2_r
+
+                    # Calcul de la position 3D dans le repère caméra natif
                     if distance > 0:
-                        x_meters = ((x_center - self.cx) * distance) / self.fx
-                        y_meters = ((y_center - self.cy) * distance) / self.fy
+                        x_meters = ((x_center_orig - self.cx) * distance) / self.fx
+                        y_meters = ((y_center_orig - self.cy) * distance) / self.fy
                         text_coord = f"X: {x_meters:.2f}m, Y: {y_meters:.2f}m, Z: {distance:.2f}m"
                     else:
                         x_meters, y_meters = None, None
                         text_coord = "X: ---, Y: ---, Z: ---"
 
+                    # Remplissage du message ROS 2 (Coordonnées dans le repère ORIGINAL)
                     detection = Detection2D()
-                    detection.bbox.center.position.x = float(x_center)
-                    detection.bbox.center.position.y = float(y_center)
-                    detection.bbox.size_x = float(x2 - x1)
-                    detection.bbox.size_y = float(y2 - y1)
+                    detection.bbox.center.position.x = float(x_center_orig)
+                    detection.bbox.center.position.y = float(y_center_orig)
+                    detection.bbox.size_x = size_x_orig
+                    detection.bbox.size_y = size_y_orig
 
-                    hyp = ObjectHypothesisWithPose() # Hypothèse sur l'objet détecté et sa distance dans l'id de la pose
-                    hyp.hypothesis.class_id = str(label) # Nom ou id de l'objet (alien plushie)
-                    hyp.hypothesis.score = confidence / 100.0  # Confiance de la détection (0.0 à 1.0)
+                    hyp = ObjectHypothesisWithPose()
+                    hyp.hypothesis.class_id = str(label)
+                    hyp.hypothesis.score = confidence / 100.0
                     hyp.pose.pose.position.x = float(x_meters) if x_meters is not None else 0.0
                     hyp.pose.pose.position.y = float(y_meters) if y_meters is not None else 0.0
-                    hyp.pose.pose.position.z = float(distance)  # Distance en mètres dans la coord z de la pose
+                    hyp.pose.pose.position.z = float(distance)
 
                     detection.results.append(hyp)
                     msg_array.detections.append(detection)
                 
+                    # Tracé sur l'image d'origine pour la vérification visuelle
                     custom_label = f"{label} ({confidence:.1f}%) | {text_coord}"
-                    cv2.rectangle(annotated_image, (x1,y1), (x2,y2), self.box_color, 2)
-                    cv2.circle(annotated_image, (x_center, y_center), 4, (0, 0, 255), -1)
-                    cv2.putText(annotated_image, custom_label, (x1, y1-10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, self.box_color, 2)
-                    
-                    (tw, th), _ = cv2.getTextSize(f"{distance:.2f} m", cv2.FONT_HERSHEY_SIMPLEX, 10.0, 14)           
-                    tx = 30                                                            
-                    ty = h - 30                                         
-                    overlay = annotated_image.copy() 
-                                        
-                    cv2.rectangle(overlay, (tx - 10, ty - th - 10),              
-                                (tx + tw + 10, ty + 10), (0, 0, 0), -1)        
-                    cv2.addWeighted(overlay, 0.5, annotated_image, 0.5, 0, annotated_image)                             
-                    cv2.putText(annotated_image, f"{distance:.2f} m", (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 
-                                10.0, (0, 255, 0), 14, cv2.LINE_AA) 
+                    cv2.rectangle(annotated_image, (x1_orig, y1_orig), (x2_orig, y2_orig), self.box_color, 2)
+                    cv2.circle(annotated_image, (x_center_orig, y_center_orig), 4, (0, 0, 255), -1)
+                    cv2.putText(annotated_image, custom_label, (x1_orig, y1_orig - 10), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.box_color, 2)
                     
             self.pub_detections.publish(msg_array)
 
             cv2.putText(
                 annotated_image, 
                 f"Inference: {inference_time:.1f} ms ({fps:.0f} FPS)", 
-                (30, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 
-                1, 
-                (0, 0, 255), 
-                2
-                )
+                (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2
+            )
             
             cv2.imshow("BGR Image with YOLO", annotated_image)
-
-            depth_vis = cv2.normalize(cv_depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-            depth_colormap = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-            
-            #cv2.imshow("Depth Image (sync)", depth_colormap)
-
             cv2.waitKey(1)
 
         except Exception as e:

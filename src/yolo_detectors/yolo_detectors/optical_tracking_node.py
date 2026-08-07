@@ -53,9 +53,9 @@ class OpticalTrackingNode(Node):
         self.last_holding_arm            = None   # dict shoulder/elbow/wrist
         self.throw_start_time            = None
 
-        # History for detecting hand-object separation
-        self.hand_object_distance_history = []
-        self.max_distance_history_len     = 5
+        # History for computing object release speed
+        self.object_position_history = []
+        self.max_history_len         = 5
 
         # Throw detection thresholds
         self.throw_min_release_speed  = self.declare_parameter('throw_min_release_speed', 1.5).value   # m/s
@@ -67,6 +67,10 @@ class OpticalTrackingNode(Node):
         self.flow_roi          = None   # (x1, y1, x2, y2) in pixels, current ROI of tracking
         self.flow_arm_mask     = None   # full-frame mask, arm excluded, frozen at release
         self.flow_object_depth = None   # last known object depth (m)
+
+        # Permet de filtrer les micro-coupures de 1 frame de YOLO/Profondeur
+        self.lost_contact_count       = 0
+        self.max_lost_contact_frames  = 3   # Exige 3 frames consécutives sans contact
 
 
         ######################################################################
@@ -273,10 +277,10 @@ class OpticalTrackingNode(Node):
 
         return mask
 
-    def update_throw_detection(self, is_held, holding_arm, object_center_meters, bbox, wx, wy, cv_depth_image, dt):
+    def update_throw_detection(self, is_held, holding_arm, object_center_meters, bbox, wx, wy, cv_depth_image, dt, curr_stamp):
         """
         Manages the transition IDLE -> HOLDING -> THROWN.
-        Returns True if this frame marks the start of the throw..
+        Returns True if this frame marks the start of the throw.
         """
         throw_triggered = False
 
@@ -290,51 +294,49 @@ class OpticalTrackingNode(Node):
                 self.consecutive_hold_frames = 0
 
         elif self.tracking_state == 'HOLDING':
-            # Continuous update of the last known state as long as the object is held.
             if is_held:
+                # Réinitialisation du compteur si le contact est confirmé
+                self.lost_contact_count = 0
                 self.last_valid_bbox = bbox
                 self.last_valid_object_center_m = object_center_meters
                 self.last_holding_arm = holding_arm
 
-                dist = self.compute_hand_object_distance_3d(
-                    object_center_meters, wx, wy, cv_depth_image
-                )
-                if dist is not None:
-                    self.hand_object_distance_history.append(dist)
-                    if len(self.hand_object_distance_history) > self.max_distance_history_len:
-                        self.hand_object_distance_history.pop(0)
+                # Historique basé sur le timestamp ROS précis de l'image
+                if object_center_meters is not None:
+                    self.object_position_history.append((curr_stamp, object_center_meters))
+                    if len(self.object_position_history) > self.max_history_len:
+                        self.object_position_history.pop(0)
             else:
-                # Contact lost: check if it is a genuine throw.
-                if len(self.hand_object_distance_history) >= 2 and dt > 0:
-                    delta_dist = self.hand_object_distance_history[-1] - self.hand_object_distance_history[0]
-                    elapsed = dt * (len(self.hand_object_distance_history) - 1)
-                    separation_speed = delta_dist / elapsed if elapsed > 0 else 0.0
-                    # Rough approximation; refined in the next step using optical flow
-                else:
-                    separation_speed = 0.0
+                self.lost_contact_count += 1
 
-                if separation_speed >= self.throw_min_release_speed:
-                    # Throw confirmation: contact lost + object was held steadily beforehand + object speed 
-                    # superior to the threshold
-                    self.tracking_state = 'THROWN'
-                    self.throw_start_time = time.time()
-                    throw_triggered = True
-                    self.get_logger().info(
-                        f"THROW DETECTED (speed: {separation_speed:.2f} m/s). "
-                        f"Last known BB: {self.last_valid_bbox}"
-                        f"Last position: {self.last_valid_object_center_m}"
-                    )
+                # On ne prend la décision qu'après au moins N frames de perte de contact confirmée
+                if self.lost_contact_count >= self.max_lost_contact_frames:
+                    release_speed = 0.0
+                    if len(self.object_position_history) >= 2:
+                        t_old, pos_old = self.object_position_history[0]
+                        t_new, pos_new = self.object_position_history[-1]
+                        
+                        dist_3d = float(np.linalg.norm(np.array(pos_new) - np.array(pos_old)))
+                        elapsed = t_new - t_old
+                        release_speed = dist_3d / elapsed if elapsed > 0 else 0.0
 
-                else:
-                    # Contact lost but too slow to be a throw -> likely noise or a slow, intentional release;
-                    # revert to IDLE instead of THROWN
-                    self.tracking_state = 'IDLE'
-                    self.get_logger().info(
-                        f"Contact lost but speed insufficient ({separation_speed:.2f} m/s) - reverting to IDLE."
-                    )
+                    if release_speed >= self.throw_min_release_speed:
+                        self.tracking_state = 'THROWN'
+                        self.throw_start_time = curr_stamp
+                        throw_triggered = True
+                        self.get_logger().info(
+                            f"THROW DETECTED (speed: {release_speed:.2f} m/s). "
+                            f"Last position: {self.last_valid_object_center_m}"
+                        )
+                    else:
+                        self.tracking_state = 'IDLE'
+                        self.get_logger().info(
+                            f"Contact lost confirmed but speed insufficient ({release_speed:.2f} m/s) - reverting to IDLE."
+                        )
 
-                self.consecutive_hold_frames = 0
-                self.hand_object_distance_history.clear()
+                    self.consecutive_hold_frames = 0
+                    self.lost_contact_count = 0
+                    self.object_position_history.clear()
 
         return throw_triggered
 
@@ -810,17 +812,27 @@ class OpticalTrackingNode(Node):
                             2,
                         )
 
+            is_held_global = False
+            best_holding_arm = None
+            best_holding_arm_dist = None
+            best_obj_center_meters = None
+            best_bbox = None
+            best_wx, best_wy = None, None
+            best_obj_pixels = None
+            best_size_x, best_size_y = 0, 0
+
+            # 1. Identifier l'objet cible et voir s'il est tenu
             for detection in yolo_objects.detections:
                 if len(detection.results) == 0:
                     continue
                 if detection.results[0].hypothesis.class_id != self.target_class_id:
                     continue
+                
                 x_center = detection.bbox.center.position.x
                 y_center = detection.bbox.center.position.y
                 size_x = detection.bbox.size_x
                 size_y = detection.bbox.size_y
-                object_center_pixels = (int(x_center), int(y_center))
-
+                
                 x1 = max(0, min(int(x_center - size_x / 2.0), w_color - 1))
                 y1 = max(0, min(int(y_center - size_y / 2.0), h_color - 1))
                 x2 = max(0, min(int(x_center + size_x / 2.0), w_color - 1))
@@ -836,6 +848,7 @@ class OpticalTrackingNode(Node):
                     if self.is_valid_object_position(candidate):
                         object_center_meters = candidate
 
+                # Annotation persistante pour la calibration (optionnel)
                 if object_center_meters is not None and self.annotations_mode:
                     x_cam, y_cam, z_cam = object_center_meters
                     x_robot, y_robot, z_robot = self.transform_position_to_robot(x_cam, y_cam, z_cam)
@@ -848,11 +861,9 @@ class OpticalTrackingNode(Node):
                     cv2.putText(annotated_image, calib_text_robot, (x1, y2 + 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-                # Check if the object is held by a person
-                is_held = False
+                # Vérifier si cet objet précis est tenu
                 holding_arm = None
                 holding_arm_dist = None
-
                 for arm in valid_arms:
                     wx, wy = arm["wrist"]
                     dist = self.compute_hand_object_distance_3d(object_center_meters, wx, wy, cv_depth_image)
@@ -860,49 +871,64 @@ class OpticalTrackingNode(Node):
                         if holding_arm_dist is None or dist < holding_arm_dist:
                             holding_arm = arm
                             holding_arm_dist = dist
-                            is_held = True
-
+                            
+                # Si on trouve un objet tenu, on le sauvegarde comme cible principale
                 if holding_arm is not None:
-                    self.get_logger().info(f"Object held by {holding_arm['side']} arm (distance: {holding_arm_dist:.3f} m).")
+                    is_held_global = True
+                    best_holding_arm = holding_arm
+                    best_holding_arm_dist = holding_arm_dist
+                    best_obj_center_meters = object_center_meters
+                    best_bbox = (x1, y1, x2, y2)
+                    best_wx, best_wy = holding_arm["wrist"]
+                    best_obj_pixels = (int(x_center), int(y_center))
+                    best_size_x, best_size_y = size_x, size_y
+                    break  # Un objet tenu trouvé, on arrête de chercher
 
-                wx, wy = (holding_arm["wrist"] if holding_arm is not None else (None, None))
+            if is_held_global:
+                self.get_logger().info(f"Object held by {best_holding_arm['side']} arm (distance: {best_holding_arm_dist:.3f} m).")
 
-                throw_triggered = self.update_throw_detection(
-                    is_held, holding_arm, object_center_meters,
-                    (x1, y1, x2, y2), wx, wy, cv_depth_image, dt
-                )
+            # 2. Mettre à jour la machine d'état UNE SEULE FOIS par frame, en dehors de la boucle
+            throw_triggered = self.update_throw_detection(
+                is_held=is_held_global, 
+                holding_arm=best_holding_arm, 
+                object_center_meters=best_obj_center_meters, 
+                bbox=best_bbox, 
+                wx=best_wx, 
+                wy=best_wy, 
+                cv_depth_image=cv_depth_image, 
+                dt=dt,
+                curr_stamp=curr_stamp
+            )
 
-                if throw_triggered:
-                    # Preparation of the initial ROI
-                    self.init_optical_flow_roi()
-                    if self.annotations_mode and self.flow_roi is not None:
-                        rx1, ry1, rx2, ry2 = self.flow_roi
-                        cv2.rectangle(annotated_image, (rx1, ry1), (rx2, ry2), (255, 0, 255), 2)
-                        cv2.putText(annotated_image, "FLOW ROI", (rx1, ry1 - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+            if throw_triggered:
+                # Préparation du flux optique au moment du lancer
+                self.init_optical_flow_roi()
+                if self.annotations_mode and self.flow_roi is not None:
+                    rx1, ry1, rx2, ry2 = self.flow_roi
+                    cv2.rectangle(annotated_image, (rx1, ry1), (rx2, ry2), (255, 0, 255), 2)
+                    cv2.putText(annotated_image, "FLOW ROI", (rx1, ry1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-                # If the object is not validated, continue to the next one
-                if not is_held:
-                    continue
-
-                # Mask construction
-                band_thickness_arm = int(self.mask_thickness_arm * max(size_x, size_y))
-                band_thickness_hand = int(self.mask_thickness_hand * max(size_x, size_y))
-                arm_mask = self.build_arm_exclusion_mask((h_color, w_color), holding_arm, band_thickness_arm, band_thickness_hand)
+            # 3. Dessiner les masques et les annotations uniquement si on est activement en train de tenir
+            if is_held_global and best_holding_arm is not None:
+                band_thickness_arm = int(self.mask_thickness_arm * max(best_size_x, best_size_y))
+                band_thickness_hand = int(self.mask_thickness_hand * max(best_size_x, best_size_y))
+                arm_mask = self.build_arm_exclusion_mask((h_color, w_color), best_holding_arm, band_thickness_arm, band_thickness_hand)
 
                 if self.debug_mask_overlay:
                     debug_overlay = annotated_image.copy()
                     debug_overlay[arm_mask == 0] = (0, 0, 255) 
                     annotated_image[:] = cv2.addWeighted(debug_overlay, 0.4, annotated_image, 0.6, 0)
 
-                # Annotation if the object is validated 
-                if self.annotations_mode and is_held and holding_arm is not None:
-                    cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                    cv2.circle(annotated_image, (int(x_center), int(y_center)), 6, (0, 255, 0), -1)
-                    cv2.putText(annotated_image, "[VALIDATED]", (x1, y1 - 10),
+                if self.annotations_mode:
+                    bx1, by1, bx2, by2 = best_bbox
+                    cv2.rectangle(annotated_image, (bx1, by1), (bx2, by2), (0, 255, 0), 3)
+                    cv2.circle(annotated_image, best_obj_pixels, 6, (0, 255, 0), -1)
+                    cv2.putText(annotated_image, "[VALIDATED]", (bx1, by1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                    cv2.line(annotated_image, object_center_pixels, (wx, wy), (0, 255, 255), 2)   
+                    cv2.line(annotated_image, best_obj_pixels, (best_wx, best_wy), (0, 255, 255), 2)
 
+            # 4. Continuer le tracking du flot optique si relâché
             if self.tracking_state == 'THROWN':
                 self.process_thrown_object(curr_gray, cv_depth_image, dt, annotated_image)
 

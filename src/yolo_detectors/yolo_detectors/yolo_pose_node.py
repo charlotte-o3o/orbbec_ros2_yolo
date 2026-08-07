@@ -108,53 +108,78 @@ class YoloPoseNode(Node):
             cv_color_image = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
             cv_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
 
+            # 1. Dimensions de l'image d'origine
+            h_orig, w_orig = cv_color_image.shape[:2]
+
+            # 2. Rotation à 90° (Ajuste cv2.ROTATE_90_CLOCKWISE / COUNTERCLOCKWISE selon ton besoin)
+            rot_code = cv2.ROTATE_90_COUNTERCLOCKWISE 
+            cv_color_rot = cv2.rotate(cv_color_image, rot_code)
+
             start_time = time.perf_counter()
-            results = self.model(cv_color_image, stream=True, verbose=False, conf=self.confidence_threshold)           
+            # Inférence YOLO Pose sur l'image pivotée
+            results = self.model(cv_color_rot, stream=True, verbose=False, conf=self.confidence_threshold)           
             results = list(results)
             end_time = time.perf_counter() 
 
             inference_time = (end_time - start_time) * 1000
             fps = 1000.0 / inference_time if inference_time > 0 else 0.0
 
-            annotated_image = cv_color_image.copy()
+            annotated_image = cv_color_image.copy() # Visualisation sur l'image d'origine
 
             boxes = results[0].boxes
             keypoints_object = results[0].keypoints
             num_persons = len(boxes) if boxes is not None else 0
 
-            # Hauteur et largeur de l'image de profondeur pour éviter les débordements de pixels
-            h, w = cv_depth_image.shape[:2]
-
             msg_pose_array = HumanPoseArray()
-            msg_pose_array.header = color_msg.header # Copie du timestamp de synchronisation
+            msg_pose_array.header = color_msg.header # Timestamp de synchronisation
             
             if boxes is not None and keypoints_object is not None and cv_depth_image is not None:
 
-                kpts = keypoints_object.data.cpu().numpy()
+                kpts_rot = keypoints_object.data.cpu().numpy()
 
                 for i, _ in enumerate(boxes):
 
-                    if i >= len(kpts):
+                    if i >= len(kpts_rot):
                         continue
 
-                    person_kpts = kpts[i]
+                    person_kpts_rot = kpts_rot[i]
+                    person_kpts_orig = []
 
+                    # 3. Remapping de tous les 17 keypoints vers le repère d'origine
+                    for kp in person_kpts_rot:
+                        x_r, y_r, conf = kp
+                        if rot_code == cv2.ROTATE_90_CLOCKWISE:
+                            x_o = float(y_r)
+                            y_o = float(h_orig - 1 - x_r)
+                        elif rot_code == cv2.ROTATE_90_COUNTERCLOCKWISE:
+                            x_o = float(w_orig - 1 - y_r)
+                            y_o = float(x_r)
+                        else:
+                            x_o, y_o = float(x_r), float(y_r)
+                        
+                        person_kpts_orig.append([x_o, y_o, conf])
+
+                    person_kpts_orig = np.array(person_kpts_orig)
+
+                    # 4. Dessin des membres du squelette sur l'image d'origine
                     for pt1_idx, pt2_idx in self.skeleton_connections:
-                        x1, y1, conf1 = person_kpts[pt1_idx]
-                        x2, y2, conf2 = person_kpts[pt2_idx]
+                        x1, y1, conf1 = person_kpts_orig[pt1_idx]
+                        x2, y2, conf2 = person_kpts_orig[pt2_idx]
 
                         if conf1 > 0.5 and conf2 > 0.5:
                             start_point = (int(x1), int(y1))
                             end_point = (int(x2), int(y2))
                             cv2.line(annotated_image, start_point, end_point, self.line_color, 2)
 
-                    for kp in person_kpts:
+                    # Dessin des keypoints
+                    for kp in person_kpts_orig:
                         kp_x, kp_y, kp_conf = kp
-                        if kp_conf > 0.5:  # Seuil de confiance pour afficher le point
+                        if kp_conf > 0.5:
                             cv2.circle(annotated_image, (int(kp_x), int(kp_y)), 4, self.circle_color, -1)
 
-                    x_l_shoulder, y_l_shoulder, conf_l = person_kpts[5] # Épaule gauche
-                    x_r_shoulder, y_r_shoulder, conf_r = person_kpts[6] # Épaule droite
+                    # 5. Calcul du centre des épaules dans l'image d'origine
+                    x_l_shoulder, y_l_shoulder, _ = person_kpts_orig[5] # Épaule gauche
+                    x_r_shoulder, y_r_shoulder, _ = person_kpts_orig[6] # Épaule droite
 
                     x_mean_shoulder = int((x_l_shoulder + x_r_shoulder) / 2)
                     y_mean_shoulder = int((y_l_shoulder + y_r_shoulder) / 2)
@@ -162,9 +187,10 @@ class YoloPoseNode(Node):
                     if x_mean_shoulder == 0 and y_mean_shoulder == 0:
                         continue
 
-                    x_mean_shoulder = max(0, min(x_mean_shoulder, w - 1))
-                    y_mean_shoulder = max(0, min(y_mean_shoulder, h - 1))
+                    x_mean_shoulder = max(0, min(x_mean_shoulder, w_orig - 1))
+                    y_mean_shoulder = max(0, min(y_mean_shoulder, h_orig - 1))
 
+                    # Profondeur mesurée sur l'image depth d'origine (non pivotée)
                     distance_box_m = cv_depth_image[y_mean_shoulder, x_mean_shoulder] / 1000.0
 
                     if distance_box_m > 0:
@@ -176,19 +202,19 @@ class YoloPoseNode(Node):
                         text_coord = "X: ---, Y: ---, Z: ---"
 
                     human_pose_msg = HumanPose()
-                    human_pose_msg.id = int(i) # ID de la personne détectée
+                    human_pose_msg.id = int(i)
 
-                    # Remplissage du centre 3D de l'humain (X, Y, Z en mètres)
+                    # Coordonnées 3D publiées dans le repère caméra natif
                     human_pose_msg.position_centre_3d.x = float(x_meters) if x_meters is not None else 0.0
                     human_pose_msg.position_centre_3d.y = float(y_meters) if y_meters is not None else 0.0  
                     human_pose_msg.position_centre_3d.z = float(distance_box_m)
 
-                    # Remplissage de TOUS les 17 keypoints de la personne dans la liste
-                    for kp in person_kpts:
+                    # Publication des keypoints 2D remappés dans l'image d'origine
+                    for kp in person_kpts_orig:
                         kp_msg = Keypoint2D()
                         kp_msg.x = float(kp[0])
                         kp_msg.y = float(kp[1])
-                        kp_msg.confidence = float(kp[2]) # Score d'invisibilité/visibilité du point
+                        kp_msg.confidence = float(kp[2])
                         human_pose_msg.keypoints.append(kp_msg)
 
                     msg_pose_array.poses.append(human_pose_msg)
@@ -202,29 +228,15 @@ class YoloPoseNode(Node):
             cv2.putText(
                 annotated_image, 
                 f"Person(s): {num_persons}", 
-                (30, 40), 
-                cv2.FONT_HERSHEY_SIMPLEX, 
-                1, 
-                (255, 0, 0), 
-                2
-                )
+                (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2
+            )
             cv2.putText(
                 annotated_image, 
                 f"Inference: {inference_time:.1f} ms ({fps:.0f} FPS)", 
-                (30, 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 
-                1, 
-                (0, 0, 255), 
-                2
-                )
+                (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2
+            )
             
-            #cv2.imshow("BGR Image with YOLO-Pose", annotated_image)
-
-            depth_vis = cv2.normalize(cv_depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-            depth_colormap = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-            
-            #cv2.imshow("Depth Image (sync)", depth_colormap)
-
+            # cv2.imshow("BGR Image with YOLO-Pose", annotated_image)
             cv2.waitKey(1)
 
         except Exception as e:

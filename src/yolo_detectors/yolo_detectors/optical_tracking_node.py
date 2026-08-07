@@ -68,6 +68,20 @@ class OpticalTrackingNode(Node):
         self.flow_arm_mask     = None   # full-frame mask, arm excluded, frozen at release
         self.flow_object_depth = None   # last known object depth (m)
 
+
+        ######################################################################
+        #          CAMERA PARAMETERS (to be updated from CameraInfo)         #
+        ######################################################################
+
+        self.fps_camera        = self.declare_parameter('fps_camera', 30.0).value
+        self.fx                = 616.0  # Focal length in pixels (x-axis)
+        self.fy                = 616.0  # Focal length in pixels (y-axis)
+        self.cx                = 320.0  # Principal point x-coordinate (image center)      
+        self.cy                = 240.0  # Principal point y-coordinate (image center)
+        self.has_camera_info   = False
+
+        self.frame_count = 1
+
         ######################################################################
         #                     KALMAN FILTER PARAMETERS                       #
         ######################################################################
@@ -97,19 +111,6 @@ class OpticalTrackingNode(Node):
         self.record_mode              = self.declare_parameter('record_mode',      True).value
         self.annotations_mode         = self.declare_parameter('annotations_mode', True).value
         self.debug_mask_overlay       = self.declare_parameter('debug_mask_overlay', True).value
-
-        ######################################################################
-        #          CAMERA PARAMETERS (to be updated from CameraInfo)         #
-        ######################################################################
-
-        self.fps_camera        = 30.0
-        self.fx                = 616.0  # Focal length in pixels (x-axis)
-        self.fy                = 616.0  # Focal length in pixels (y-axis)
-        self.cx                = 320.0  # Principal point x-coordinate (image center)      
-        self.cy                = 240.0  # Principal point y-coordinate (image center)
-        self.has_camera_info   = False
-
-        self.frame_count = 1
 
         ######################################################################
         #                          VIDEO RECORDER                            #
@@ -566,6 +567,16 @@ class OpticalTrackingNode(Node):
             cv2.putText(annotated_image, "FLOW ROI", (new_x1, new_y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
+        # Display the Kalman filter's predicted position in the camera frame
+        x_cam_kf, y_cam_kf, z_cam_kf = self.transform_position_to_camera(kf_x_rob, kf_y_rob, kf_z_rob)
+        uv_kf = self.project_3d_to_pixel(x_cam_kf, y_cam_kf, z_cam_kf)
+
+        if uv_kf is not None and self.annotations_mode:
+            u, v = uv_kf
+            cv2.circle(annotated_image, (u, v), 10, (0, 165, 255), -1)
+            cv2.putText(annotated_image, "KF", (u + 15, v),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
     def build_camera_to_robot_rotation(self, roll_deg, tilt_deg):
         """
         Builds the rotation matrix from the camera frame (x up, y right, z forward,
@@ -697,6 +708,21 @@ class OpticalTrackingNode(Node):
         # Update the state and covariance
         self.kf_x = self.kf_x + (K @ y)
         self.kf_P = (np.eye(6) - K @ H_pos) @ self.kf_P
+
+    def transform_position_to_camera(self, x_rob, y_rob, z_rob):
+            """Inverse transformation: from the absolute robot coordinate system to the 3D camera coordinate system."""
+            p_rob = np.array([x_rob, y_rob, z_rob])
+            # Inversed formula : p_cam = R^T * (p_rob - offset)
+            p_cam = self.R_cam_to_robot.T @ (p_rob - self.camera_offset_in_robot)
+            return tuple(p_cam)
+
+    def project_3d_to_pixel(self, x_cam, y_cam, z_cam):
+        """Projects a 3D point from the camera coordinate system to 2D image pixels."""
+        if z_cam <= 0:
+            return None # The object is behind the camera
+        u = int((x_cam * self.fx) / z_cam + self.cx)
+        v = int((y_cam * self.fy) / z_cam + self.cy)
+        return u, v
 
     def synchronized_callback(self, color_msg, depth_msg, yolo_objects, yolo_poses):
         try: 
@@ -880,9 +906,23 @@ class OpticalTrackingNode(Node):
             if self.tracking_state == 'THROWN':
                 self.process_thrown_object(curr_gray, cv_depth_image, dt, annotated_image)
 
-
-            # Uncomment the following line if the camera is flipped upside down
-            #display_image = cv2.flip(annotated_image, -1) 
+            if self.annotations_mode:
+                if self.tracking_state == 'HOLDING':
+                    state_color = (0, 255, 0)
+                elif self.tracking_state == 'THROWN':
+                    state_color = (0, 0, 255)
+                else:
+                    state_color = (255, 255, 255)
+                    
+                cv2.putText(
+                    annotated_image, 
+                    f"STATE: {self.tracking_state}", 
+                    (20, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    1.0, 
+                    state_color, 
+                    2
+                )
 
             # Variables update for next callback
             self.prev_stamp = curr_stamp    
@@ -902,8 +942,6 @@ class OpticalTrackingNode(Node):
 
                 if self.video_writer is not None:
                     self.video_writer.write(annotated_image)
-                    # Uncomment the following line if the camera is flipped upside down
-                    #self.video_writer.write(display_image)
 
             cv2.imshow("Optical Tracking", annotated_image)
 

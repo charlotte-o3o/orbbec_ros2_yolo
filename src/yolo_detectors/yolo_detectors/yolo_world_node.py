@@ -38,7 +38,8 @@ class YoloWorldNode(Node):
             "soccer_ball",
             "white_box",
             "white_cardboard_box",
-            "headphones"
+            "headphones",
+            "orange_strap",
         ]
 
         self.model_path           = self.declare_parameter('model_path',     'weights/yolov8s-world.pt').value

@@ -14,11 +14,12 @@ yolo_pose_node:
 
 optical_tracking_node:
   ros__parameters:
+    fps_camera: 30.0
     max_dist_meter: 0.25
     mask_thickness_arm: 0.4
     mask_thickness_hand: 0.25
     target_class_id: "alien_plushie"
     debug_mask_overlay: true
-    record_mode: false
+    record_mode: true
     camera_roll_deg: -90.0
     camera_tilt_deg: 0.0

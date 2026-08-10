@@ -24,23 +24,16 @@ speed_det_node:
         speed_threshold: 1.5
         startup_grace_period: 8.0
         landing_z_threshold: 0.3
-        # The world frame is derived from the camera's own IMU gravity vector, averaged over
-        # the startup_grace_period and then frozen. Set to 'params' to fall back to the
-        # hand-measured angles below.
-        orientation_source: imu
-        imu_topic: /orbbec_external/gyro_accel/sample
-        imu_optical_frame: orbbec_external_color_optical_frame
-
-        # Fallback only (orientation_source: params). Physical mount is roll -90, pitch -30
-        # per orbbec_ros2/.env, but the sign convention there is the camera BODY frame, not
-        # the optical one, so these need confirming against the IMU-derived values logged
-        # at startup before being relied on.
+        # Hand-measured mounting angles -- the sole source of the camera->world rotation.
+        # Physical mount is roll -90, pitch -30 per orbbec_ros2/.env, but the sign
+        # convention there is the camera BODY frame, not the optical one, so these are
+        # the values calibrated against the optical frame.
         camera_tilt_deg: 15.0
         camera_roll_deg: -90.0
 
         # Real gravity. Was 8.0 to compensate for a camera->world matrix that was not a
-        # rotation (det = cos(2*tilt)) and under-read vertical motion. That matrix is fixed
-        # and the frame is now gravity-aligned by construction, so this is the true value.
+        # rotation (det = cos(2*tilt)) and under-read vertical motion. That matrix is now
+        # a proper rotation, so this is the true value.
         effective_gravity: 9.81
 
         # Robot capture box, world-frame metres. Tuned against the old sheared frame --

@@ -6,11 +6,16 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;*.warning=false"
 
 import rclpy
 from rclpy.node import Node
-from lancer_interfaces.msg import HumanPoseArray, LandingPrediction
+from rclpy.duration import Duration
+from lancer_interfaces.msg import HumanPoseArray
 import message_filters
 from vision_msgs.msg import Detection2DArray
 from cv_bridge import CvBridge
 from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import Float32MultiArray
+from geometry_msgs.msg import PointStamped
+import tf2_ros
+from tf2_geometry_msgs import do_transform_point
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -89,6 +94,20 @@ class SpeedDetNode(Node):
         # camera-optical -> world rotation. See build_rotation_from_angles().
         self.camera_tilt_deg                    = self.declare_parameter('camera_tilt_deg', 0.0).value
         self.camera_roll_deg                    = self.declare_parameter('camera_roll_deg', 0.0).value # 0 = landscape (default), 90 or -90 = camera rotated to vertical (requires calibration)
+
+        # World -> robot transform, read from TF once at startup. Tracking and prediction
+        # stay in this node's world frame; the transform is applied at the capture-box test,
+        # so the box and the published reach command are both in the robot's frame.
+        # The TF's child IS this node's world frame, so the lookup already carries both the
+        # translation and the y-up -> z-up convention change. Nothing to compose here.
+        #   robot_frame_id : the TF's parent -- what the command must be expressed in.
+        #   world_frame_id : the TF's child  -- must match the child_frame_id you publish.
+        self.robot_frame_id                     = self.declare_parameter('robot_frame_id', 'torso_link').value
+        self.world_frame_id                     = self.declare_parameter('world_frame_id', 'camera_world').value
+        self.tf_lookup_timeout                  = self.declare_parameter('tf_lookup_timeout', 10.0).value
+
+        # Gripper opening sent in the reach command packet.
+        self.reach_aperture                     = self.declare_parameter('reach_aperture', 0.15).value
 
         # True gravity. This must stay at 9.81: the camera->world matrix is a proper
         # rotation, so anything else here is compensating for a geometry bug.
@@ -179,13 +198,22 @@ class SpeedDetNode(Node):
         self.R_cam_to_world = self.build_rotation_from_angles(self.camera_roll_deg,
                                                               self.camera_tilt_deg)
 
+        # spin_thread=True gives the buffer its own thread, so it can actually fill while
+        # the constructor blocks waiting for the transform below.
+        self.tf_buffer   = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self, spin_thread=True)
+        self.R_world_to_robot, self.t_world_to_robot = self.lookup_world_to_robot()
+
         ######################################################################
         #                           PUBLISHERS                               #
         ######################################################################
 
-        self.pub_landing        = self.create_publisher(
-            LandingPrediction,
-            '/trajectory/landing_prediction',
+        # [target_x, target_y, target_z, aperture, time_to_go, is_active], target in the
+        # robot frame. Published only when a predicted trajectory actually enters the
+        # capture box; the consumer feeds its own idle packet the rest of the time.
+        self.pub_reach          = self.create_publisher(
+            Float32MultiArray,
+            '/reach_command',
             10
         )
 
@@ -282,6 +310,64 @@ class SpeedDetNode(Node):
         R = R_tilt @ R_flip @ R_roll
         self.validate_rotation(R, f"angle-derived (roll={roll_deg}, tilt={tilt_deg})")
         return R
+
+    @staticmethod
+    def quaternion_to_matrix(x, y, z, w):
+        n = np.sqrt(x*x + y*y + z*z + w*w)
+        x, y, z, w = x/n, y/n, z/n, w/n
+        return np.array([
+            [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
+            [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
+            [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)],
+        ])
+
+    def lookup_world_to_robot(self):
+        """
+        Read the static world -> robot transform once, at startup.
+
+        The TF's child is this node's world frame, so the lookup already accounts for the
+        translation AND the y-up -> z-up convention change; it is used as-is.
+
+            p_robot = R_world_to_robot @ p_world + t_world_to_robot
+
+        Velocities take the rotation alone -- adding the translation to a velocity would
+        turn a fixed offset into a fictitious speed.
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.robot_frame_id,
+                self.world_frame_id,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=float(self.tf_lookup_timeout)),
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not read TF {self.world_frame_id} -> {self.robot_frame_id} within "
+                f"{self.tf_lookup_timeout}s ({e}). The capture box and the reach command are "
+                f"both expressed in {self.robot_frame_id}, so there is nothing sensible to "
+                f"publish without it."
+            ) from e
+
+        q = tf.transform.rotation
+        t = tf.transform.translation
+
+        R = self.quaternion_to_matrix(q.x, q.y, q.z, q.w)
+        self.validate_rotation(R, f"TF-derived {self.world_frame_id}->{self.robot_frame_id}")
+
+        self.get_logger().info(
+            f"World -> robot transform read from TF: {self.world_frame_id} -> "
+            f"{self.robot_frame_id} | translation "
+            f"({t.x:+.3f}, {t.y:+.3f}, {t.z:+.3f}) m"
+        )
+        return R, np.array([t.x, t.y, t.z])
+
+    def world_point_to_robot(self, p_world):
+        """World-frame position -> robot frame (rotation + translation)."""
+        return self.R_world_to_robot @ np.asarray(p_world, dtype=float) + self.t_world_to_robot
+
+    def world_vector_to_robot(self, v_world):
+        """World-frame velocity -> robot frame (rotation only)."""
+        return self.R_world_to_robot @ np.asarray(v_world, dtype=float)
 
     def validate_rotation(self, R, label):
         """Fail loudly rather than silently skewing every trajectory."""
@@ -473,15 +559,18 @@ class SpeedDetNode(Node):
     def check_workspace_intersection(self, pos_0, vel_0, g=9.81):
         """
         Compute the time and position of entry into the robot's capture box.
+
+        pos_0 / vel_0 are in the ROBOT frame (the TF's parent), not this node's world
+        frame -- the caller transforms them first, so the box below and the reach command
+        published from the result are in the same frame the robot acts in.
+
         pos_0: [x0, y0, z0] at time t=0
         vel_0: [vx, vy, vz] at time t=0
         """
         x0, y0, z0 = pos_0
         vx, vy, vz = vel_0
 
-        # Definition of the robot's capture box, in metres in the world frame.
-        # Configurable via capture_box_* -- these were tuned against the old (sheared)
-        # world frame, so expect to re-tune them now that the geometry is corrected.
+        # Definition of the robot's capture box, in metres in the ROBOT frame.
         X_MIN, X_MAX = self.capture_box_x_min, self.capture_box_x_max
         Y_MIN, Y_MAX = self.capture_box_y_min, self.capture_box_y_max
         Z_MIN, Z_MAX = self.capture_box_z_min, self.capture_box_z_max
@@ -490,10 +579,12 @@ class SpeedDetNode(Node):
         time_steps = np.linspace(0.01, 1.5, 150)
 
         for t in time_steps:
-            # Trajectory equations under gravity (Y-axis positive upwards)
+            # Trajectory equations under gravity. The robot frame is z-up (the TF carries
+            # the convention change), so the gravity term sits on Z here -- unlike the
+            # y-up world frame the prediction upstream is fitted in.
             x_t = x0 + vx * t
-            y_t = y0 + vy * t - 0.5 * g * (t**2)
-            z_t = z0 + vz * t
+            y_t = y0 + vy * t
+            z_t = z0 + vz * t - 0.5 * g * (t**2)
 
             # Check if the point is inside the cube
             in_x = X_MIN <= x_t <= X_MAX
@@ -811,26 +902,38 @@ class SpeedDetNode(Node):
                                     f"Vx moy: {vx_moy:.2f}m/s | Vy moy: {vy_moy:.2f}m/s | Vz moy: {vz_moy:.2f}m/s"
                                 )
 
+                                # Move the parabola's anchor and velocity out of this node's
+                                # world frame and into the robot's before testing the box,
+                                # so the capture point comes back ready to publish.
+                                pos_robot = self.world_point_to_robot([rx_world, ry_world, rz_world])
+                                vel_robot = self.world_vector_to_robot([vx_moy, vy_moy, vz_moy])
+
                                 # Compute the intersection of the predicted trajectory with the robot's 3D capture box
                                 has_target, t_intercept, x_target, y_target, z_target = self.check_workspace_intersection(
-                                    pos_0=[rx_world, ry_world, rz_world],
-                                    vel_0=[vx_moy, vy_moy, vz_moy]
+                                    pos_0=pos_robot,
+                                    vel_0=vel_robot
                                 )
 
                                 if has_target:
                                     self.get_logger().info(
-                                        f"[TARGET IN WORKSPACE] Capture point: X={x_target:.2f}m, Y={y_target:.2f}m, Z={z_target:.2f}m in {t_intercept:.3f}s"
+                                        f"[TARGET IN WORKSPACE] Capture point ({self.robot_frame_id}): "
+                                        f"X={x_target:.2f}m, Y={y_target:.2f}m, Z={z_target:.2f}m in {t_intercept:.3f}s"
                                     )
 
-                                    # Publishing of intersection point and time to landing for the robot to catch the object
-                                    msg_pred = LandingPrediction()
-                                    msg_pred.time_to_landing = float(t_intercept)
-                                    msg_pred.x_landing = float(x_target)
-                                    msg_pred.y_landing = float(y_target)
-                                    msg_pred.z_landing = float(z_target)
+                                    # Reach command for the policy, in the robot frame:
+                                    # [target_x, target_y, target_z, aperture, time_to_go, is_active]
+                                    msg_reach = Float32MultiArray()
+                                    msg_reach.data = [
+                                        float(x_target),
+                                        float(y_target),
+                                        float(z_target),
+                                        float(self.reach_aperture),
+                                        float(t_intercept),
+                                        1.0,
+                                    ]
 
-                                    self.pub_landing.publish(msg_pred)
-                                    self.get_logger().info(f"[PUBLISHED] Sent to topic -> count subscribers: {self.pub_landing.get_subscription_count()}")
+                                    self.pub_reach.publish(msg_reach)
+                                    self.get_logger().info(f"[PUBLISHED] /reach_command -> count subscribers: {self.pub_reach.get_subscription_count()}")
                                 else:
                                     self.get_logger().warn("Trajectory prediction active but DOES NOT intersect the 3D capture box!")
 

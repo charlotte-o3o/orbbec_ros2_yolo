@@ -36,11 +36,23 @@ speed_det_node:
         # a proper rotation, so this is the true value.
         effective_gravity: 9.81
 
-        # Robot capture box, world-frame metres. Tuned against the old sheared frame --
-        # expect to re-tune now that the geometry is corrected.
-        capture_box_x_min: -1.0
-        capture_box_x_max: 1.0
-        capture_box_y_min: -1.0
-        capture_box_y_max: 1.0
-        capture_box_z_min: 0.0
-        capture_box_z_max: 0.2
+        # World -> robot transform, read from TF once at startup. world_frame_id must match
+        # the child_frame_id of the TF you publish; robot_frame_id is its parent, and is the
+        # frame the capture box below and the /reach_command target are expressed in.
+        robot_frame_id: torso_link
+        world_frame_id: camera_world
+        tf_lookup_timeout: 10.0
+
+        # Gripper opening sent in the reach command packet.
+        reach_aperture: 0.15
+
+        # Robot capture box, in ROBOT-frame metres (x forward, y left, z up). The axis
+        # swaps you had noted are folded in: old x -> y, old y -> z, old z -> x.
+        # NOTE: the extents are carried over, but the origin moved from the camera to the
+        # robot, so these still need re-measuring against the robot's actual reach.
+        capture_box_x_min: 0.20
+        capture_box_x_max: 0.40
+        capture_box_y_min: -0.12
+        capture_box_y_max: 0.12
+        capture_box_z_min: 0.00
+        capture_box_z_max: 0.40

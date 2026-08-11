@@ -23,4 +23,4 @@ optical_tracking_node:
     record_mode: true
     camera_roll_deg: -90.0
     camera_tilt_deg: 0.0
-    throw_min_release_speed: 0.8
+    throw_min_release_speed: 0.2

@@ -22,6 +22,7 @@ lstm_node.py
 speed_det_node.py
 fine_tune_yolo_node.py
 old_speed_det_node.py
+old_optical_tracking_node.py
 
 # Launch, config, param files
 speed_det.launch.py

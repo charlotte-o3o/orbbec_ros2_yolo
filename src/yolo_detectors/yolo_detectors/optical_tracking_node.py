@@ -16,6 +16,7 @@ matplotlib.use('Agg')
 import cv2
 import time
 import numpy as np
+from collections import deque
 
 class OpticalTrackingNode(Node):
     def __init__(self):
@@ -28,11 +29,13 @@ class OpticalTrackingNode(Node):
         self.min_valid_z              = self.declare_parameter('min_valid_z',      0.1).value
         self.max_valid_z              = self.declare_parameter('max_valid_z',      10.0).value
         self.max_valid_xy             = self.declare_parameter('max_valid_xy',     5.0).value
-        self.max_valid_speed          = self.declare_parameter('max_valid_speed',  25.0).value
+        self.max_valid_speed          = self.declare_parameter('max_valid_speed',  8.0).value
         self.max_dist_meter           = self.declare_parameter('max_dist_meter',   0.25).value
         self.mask_thickness_arm       = self.declare_parameter('mask_thickness_arm',   0.4).value
         self.mask_thickness_hand      = self.declare_parameter('mask_thickness_hand',   0.25).value
         self.target_class_id          = self.declare_parameter('target_class_id', 'bottle').value
+        self.gravity                  = self.declare_parameter('gravity', 8.0).value # Constant acceleration due to gravity (m/s^2) in the robot frame (z-axis)
+        self.velocity_grace_period_s  = self.declare_parameter('velocity_grace_period_s', 0.15).value
 
         self.get_logger().info(f"Tracking node configured for target class: '{self.target_class_id}'")
 
@@ -53,9 +56,11 @@ class OpticalTrackingNode(Node):
         self.last_holding_arm            = None   # dict shoulder/elbow/wrist
         self.throw_start_time            = None
 
-        # History for computing object release speed
+        # Histories for computing object release speed
         self.object_position_history = []
         self.max_history_len         = 5
+        self.hand_velocity_history   = deque(maxlen=10)
+        self.wrist_position_history  = []
 
         # Throw detection thresholds
         self.throw_min_release_speed  = self.declare_parameter('throw_min_release_speed', 1.5).value   # m/s
@@ -67,6 +72,33 @@ class OpticalTrackingNode(Node):
         self.flow_roi          = None   # (x1, y1, x2, y2) in pixels, current ROI of tracking
         self.flow_arm_mask     = None   # full-frame mask, arm excluded, frozen at release
         self.flow_object_depth = None   # last known object depth (m)
+
+        ######################################################################
+        #      CONTINUOUS WRIST-RELATIVE OBJECT TRACKING (HOLDING phase)     #
+        ######################################################################
+        # Instead of re-querying YOLO-World every frame (which frequently
+        # misses the object under motion blur during the throwing gesture,
+        # cutting the release-velocity estimation window short), we track a
+        # moving pixel cluster inside a wide ROI centered on the wrist, with
+        # the arm/hand masked out. As long as this cluster moves together
+        # with the wrist, the object is considered held. Release is detected
+        # when the cluster's measured 3D velocity diverges from the wrist's,
+        # and the *measured* cluster velocity is injected directly into the
+        # Kalman filter as the initial throw velocity (instead of an average
+        # of past wrist velocity samples).
+        self.wrist_roi_radius_ratio       = self.declare_parameter('wrist_roi_radius_ratio', 2.0).value
+        self.min_cluster_area_px          = self.declare_parameter('min_cluster_area_px', 15).value
+        self.divergence_pos_threshold_m   = self.declare_parameter('divergence_pos_threshold_m', 0.08).value   # 8 cm
+        self.divergence_vel_threshold_mps = self.declare_parameter('divergence_vel_threshold_mps', 0.35).value  # m/s
+        self.divergence_confirm_frames    = self.declare_parameter('divergence_confirm_frames', 2).value
+        self.max_missed_cluster_frames    = self.declare_parameter('max_missed_cluster_frames', 6).value
+
+        self.hold_roi              = None   # (x1, y1, x2, y2), wrist-centered ROI refreshed every HOLDING frame
+        self.hold_roi_half_size    = None   # fixed half-size (px) of hold_roi, set once when entering HOLDING
+        self.divergence_count      = 0      # consecutive frames where cluster diverges from wrist
+        self.missed_cluster_count  = 0      # consecutive frames with no valid moving cluster found
+        self.wrist_position_history_cam = []  # (stamp, (x,y,z)) in camera frame, for regression-based wrist velocity
+        self.last_cluster_state    = None   # dict with last measured cluster {pos_cam, pos_rob, vel_rob}, for release injection
 
         # Permet de filtrer les micro-coupures de 1 frame de YOLO/Profondeur
         self.lost_contact_count       = 0
@@ -95,8 +127,6 @@ class OpticalTrackingNode(Node):
         # Covariance matrix (estimation uncertainty)
         self.kf_P = np.eye(6)
         
-        # Constant acceleration due to gravity (m/s^2) in the robot frame (z-axis)
-        self.gravity = 9.81 
         
         # Process noise matrix Q
         # Represents the uncertainties of the physical model (wind, friction, spin)
@@ -246,6 +276,24 @@ class OpticalTrackingNode(Node):
 
         return dist_3d
 
+    def get_wrist_position_3d(self, wx, wy, cv_depth_image):
+        """Computes the 3D position (camera frame) of a wrist pixel, using the depth image."""
+        if wx is None or wy is None or cv_depth_image is None:
+            return None
+
+        h, w = cv_depth_image.shape[:2]
+        wx = max(0, min(int(wx), w - 1))
+        wy = max(0, min(int(wy), h - 1))
+
+        wrist_z = cv_depth_image[wy, wx] / 1000.0
+        if wrist_z < self.min_valid_z:
+            return None
+
+        wrist_x = ((wx - self.cx) * wrist_z) / self.fx
+        wrist_y = ((wy - self.cy) * wrist_z) / self.fy
+
+        return (wrist_x, wrist_y, wrist_z)
+
     def is_near_hand_3d(self, obj_center_meters, wx_px, wy_px, cv_depth_image):
         """
         Returns True if the distance between the object and a given wrist is inferior to the threshold.
@@ -279,73 +327,59 @@ class OpticalTrackingNode(Node):
 
     def update_throw_detection(self, is_held, holding_arm, object_center_meters, bbox, wx, wy, cv_depth_image, dt, curr_stamp):
         """
-        Manages the transition IDLE -> HOLDING -> THROWN.
-        Returns True if this frame marks the start of the throw.
-        """
-        throw_triggered = False
+        Manages only the IDLE -> HOLDING transition, via YOLO-World object detection +
+        wrist proximity. This bootstrap step is reliable because the arm is still static
+        when the object is first grasped (no motion blur yet).
 
+        Release detection (HOLDING -> THROWN) is intentionally NOT handled here anymore:
+        it used to rely on YOLO-World re-detecting the object every frame, which regularly
+        fails under motion blur during the actual throwing gesture, truncating the release-
+        velocity estimation window before the arm reaches its true peak speed. That logic
+        now lives in update_wrist_relative_tracking(), called separately from
+        synchronized_callback while tracking_state == 'HOLDING'.
+        """
         if self.tracking_state == 'IDLE':
             if is_held:
                 self.consecutive_hold_frames += 1
                 if self.consecutive_hold_frames >= self.hold_confirm_frames:
                     self.tracking_state = 'HOLDING'
+                    self.last_valid_bbox = bbox
+                    self.last_valid_object_center_m = object_center_meters
+                    self.last_holding_arm = holding_arm
+
+                    # Reset the continuous wrist-relative tracking state for this new grasp
+                    self.hold_roi_half_size = None
+                    self.divergence_count = 0
+                    self.missed_cluster_count = 0
+                    self.wrist_position_history_cam.clear()
+                    self.last_cluster_state = None
+
                     self.get_logger().info("Object detected and held -> HOLDING state.")
             else:
                 self.consecutive_hold_frames = 0
 
         elif self.tracking_state == 'HOLDING':
+            # Opportunistic bookkeeping only: refresh last known bbox/center/arm whenever
+            # YOLO-World *does* manage a clean detection, but this is no longer required
+            # for release detection to work.
             if is_held:
-                # Réinitialisation du compteur si le contact est confirmé
-                self.lost_contact_count = 0
                 self.last_valid_bbox = bbox
                 self.last_valid_object_center_m = object_center_meters
                 self.last_holding_arm = holding_arm
 
-                # Historique basé sur le timestamp ROS précis de l'image
-                if object_center_meters is not None:
-                    self.object_position_history.append((curr_stamp, object_center_meters))
-                    if len(self.object_position_history) > self.max_history_len:
-                        self.object_position_history.pop(0)
-            else:
-                self.lost_contact_count += 1
-
-                # On ne prend la décision qu'après au moins N frames de perte de contact confirmée
-                if self.lost_contact_count >= self.max_lost_contact_frames:
-                    release_speed = 0.0
-                    if len(self.object_position_history) >= 2:
-                        t_old, pos_old = self.object_position_history[0]
-                        t_new, pos_new = self.object_position_history[-1]
-                        
-                        dist_3d = float(np.linalg.norm(np.array(pos_new) - np.array(pos_old)))
-                        elapsed = t_new - t_old
-                        release_speed = dist_3d / elapsed if elapsed > 0 else 0.0
-
-                    if release_speed >= self.throw_min_release_speed:
-                        self.tracking_state = 'THROWN'
-                        self.throw_start_time = curr_stamp
-                        throw_triggered = True
-                        self.get_logger().info(
-                            f"THROW DETECTED (speed: {release_speed:.2f} m/s). "
-                            f"Last position: {self.last_valid_object_center_m}"
-                        )
-                    else:
-                        self.tracking_state = 'IDLE'
-                        self.get_logger().info(
-                            f"Contact lost confirmed but speed insufficient ({release_speed:.2f} m/s) - reverting to IDLE."
-                        )
-
-                    self.consecutive_hold_frames = 0
-                    self.lost_contact_count = 0
-                    self.object_position_history.clear()
-
-        return throw_triggered
-
-    def init_optical_flow_roi(self):
+    def init_optical_flow_roi(self, cv_depth_image, release_state=None):
         """
-        Initializes the optical flow tracking state at the precise moment of the throw. 
+        Initializes the optical flow tracking state at the precise moment of the throw.
         Uses the last known bounding box/position/arm (captured during HOLDING)
         and self.prev_gray, which corresponds to the last frame where the object was
         still being held.
+
+        release_state (optional): dict {pos_cam, pos_rob, vel_cam, vel_rob} produced by
+        update_wrist_relative_tracking() when release was detected via cluster/wrist
+        divergence. When provided, its position and velocity are used directly to seed
+        the Kalman filter instead of the last YOLO-World bbox position and an average of
+        past wrist velocity samples - this is a direct measurement of the object at the
+        moment it separates from the hand, not an inference from arm motion.
         """
         if self.last_valid_bbox is None or self.prev_gray is None:
             self.get_logger().warn(
@@ -377,25 +411,46 @@ class OpticalTrackingNode(Node):
             (h_frame, w_frame), self.last_holding_arm, band_thickness_arm, band_thickness_hand
         )
 
-        self.flow_object_depth = (
+        depth_reseeded = self.estimate_object_depth_in_roi(
+            cv_depth_image, self.flow_roi, self.flow_arm_mask, self.flow_object_depth
+        )
+        if depth_reseeded is not None:
+            self.flow_object_depth = depth_reseeded
+
+        """self.flow_object_depth = (
             self.last_valid_object_center_m[2]
             if self.last_valid_object_center_m is not None else None
-        )
+        )"""
 
         self.get_logger().info(
             f"Initialized optical flow ROI: {self.flow_roi}, "
-            f"reference depth: {self.flow_object_depth}"
+            f"reference depth: {self.flow_object_depth:.2f} m, "
         )
 
-        # Kalman filter initialization at the moment of the throw, using the last known position and a zero initial velocity.
-        
-        # Obtain the last known position in the robot frame
-        x_cam, y_cam, z_cam = self.last_valid_object_center_m
-        x_rob, y_rob, z_rob = self.transform_position_to_robot(x_cam, y_cam, z_cam)
+        # Kalman filter initialization at the moment of the throw.
 
-        # Initial velocity estimation: we can use the last known optical flow to estimate 
-        # the initial velocity, but for simplicity, we can start with zero and let the first optical flow measurement correct it.
-        vx_init, vy_init, vz_init = 0.0, 0.0, 0.0 
+        if release_state is not None:
+            # Preferred path: position and velocity directly measured on the moving
+            # pixel cluster at the moment it diverged from the wrist.
+            x_rob, y_rob, z_rob = release_state["pos_rob"]
+            vx_init, vy_init, vz_init = release_state["vel_rob"]
+            self.get_logger().info(
+                f"Injecting measured cluster release velocity: "
+                f"vx={vx_init:.2f}, vy={vy_init:.2f}, vz={vz_init:.2f} m/s"
+            )
+        else:
+            # Fallback path (release_state unavailable, e.g. bootstrap edge case):
+            # last known YOLO-World object position + average of past wrist velocity
+            # samples, as before.
+            x_cam, y_cam, z_cam = self.last_valid_object_center_m
+            x_rob, y_rob, z_rob = self.transform_position_to_robot(x_cam, y_cam, z_cam)
+
+            if hasattr(self, 'last_release_velocity_cam') and self.last_release_velocity_cam is not None:
+                vx_cam, vy_cam, vz_cam = self.last_release_velocity_cam
+                vx_init, vy_init, vz_init = self.transform_velocity(vx_cam, vy_cam, vz_cam, self.R_cam_to_robot)
+                self.get_logger().info(f"Injecting initial velocity from hand: vx={vx_init:.2f}, vy={vy_init:.2f}, vz={vz_init:.2f} m/s")
+            else:
+                vx_init, vy_init, vz_init = 0.0, 0.0, 0.0
 
         # Initialize the Kalman filter state vector
         self.kf_x = np.array([
@@ -408,7 +463,7 @@ class OpticalTrackingNode(Node):
         ])
 
         # Initialize the covariance matrix with small uncertainties for position and larger for velocity
-        self.kf_P = np.diag([0.05, 0.05, 0.05, 5.0, 5.0, 5.0])
+        self.kf_P = np.diag([0.05, 0.05, 0.05, 0.5, 0.5, 0.5])
 
         self.get_logger().info(
             f"Initialized optical flow ROI : {self.flow_roi},"
@@ -433,8 +488,8 @@ class OpticalTrackingNode(Node):
             return None
 
         flow = cv2.calcOpticalFlowFarneback(
-            prev_roi, curr_roi, None,
-            pyr_scale=0.5, levels=3, winsize=15,
+            prev_roi, curr_roi, None,   
+            pyr_scale=0.5, levels=4, winsize=31,
             iterations=3, poly_n=5, poly_sigma=1.2, flags=0
         )
 
@@ -447,9 +502,25 @@ class OpticalTrackingNode(Node):
         if not np.any(valid):
             return None
 
-        # Median rather than mean: robust to leftover arm pixels or reflections on the object
-        vx_px = float(np.median(flow[..., 0][valid]))
-        vy_px = float(np.median(flow[..., 1][valid]))
+        u = flow[..., 0][valid]
+        v = flow[..., 1][valid]
+
+        # Calculer la magnitude (puissance) du mouvement pour filtrer le fond statique
+        magnitude = np.sqrt(u**2 + v**2)
+        
+        # Ne garder que les pixels qui bougent d'au moins 1 pixel
+        moving_pixels = magnitude > 1.0
+        
+        if np.sum(moving_pixels) > 5:
+            # S'il y a du mouvement, on fait la médiane UNIQUEMENT sur l'objet en déplacement
+            vx_px = float(np.median(u[moving_pixels]))
+            vy_px = float(np.median(v[moving_pixels]))
+        else:
+            # Aucun déplacement perçu en X/Y
+            vx_px = 0.0
+            vy_px = 0.0
+
+        self.get_logger().info(f"Raw pixel flow: vx_px={vx_px:.1f}, vy_px={vy_px:.1f}")
 
         return vx_px, vy_px
 
@@ -493,91 +564,353 @@ class OpticalTrackingNode(Node):
 
         return vx_m, vy_m, vz_m
 
-    def process_thrown_object(self, curr_gray, cv_depth_image, dt, annotated_image):
+    def detect_moving_cluster_in_roi(self, prev_gray, curr_gray, roi, arm_mask=None):
+        """
+        Finds the largest connected component of moving pixels inside the given ROI,
+        after excluding the arm/hand via arm_mask. This is used to isolate the object
+        candidate from noise, instead of taking a global median over every moving pixel.
+
+        Returns a dict {vx_px, vy_px, centroid_px (full-frame x, y), area_px} for the
+        largest valid cluster, or None if no cluster of sufficient size is found.
+        """
+        x1, y1, x2, y2 = roi
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        prev_roi = prev_gray[y1:y2, x1:x2]
+        curr_roi = curr_gray[y1:y2, x1:x2]
+
+        if prev_roi.size == 0 or curr_roi.size == 0:
+            return None
+
+        flow = cv2.calcOpticalFlowFarneback(
+            prev_roi, curr_roi, None,
+            pyr_scale=0.5, levels=3, winsize=21,
+            iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+        )
+
+        u = flow[..., 0]
+        v = flow[..., 1]
+        magnitude = np.sqrt(u ** 2 + v ** 2)
+
+        moving_mask = (magnitude > 1.0).astype(np.uint8)
+
+        if arm_mask is not None:
+            mask_roi = arm_mask[y1:y2, x1:x2]
+            moving_mask[mask_roi == 0] = 0
+
+        if not np.any(moving_mask):
+            return None
+
+        # Connected components on the moving-pixel mask: keep only the largest
+        # blob so that isolated noisy pixels scattered across the ROI don't
+        # get mixed into a single median (unlike the global-median approach).
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            moving_mask, connectivity=8
+        )
+
+        if num_labels <= 1:
+            return None  # label 0 is background, no foreground component found
+
+        # stats[:, cv2.CC_STAT_AREA] ; skip background (index 0)
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        best_label = 1 + int(np.argmax(areas))
+        best_area = int(areas[best_label - 1])
+
+        if best_area < self.min_cluster_area_px:
+            return None
+
+        component_mask = (labels == best_label)
+
+        vx_px = float(np.median(u[component_mask]))
+        vy_px = float(np.median(v[component_mask]))
+
+        cx_roi, cy_roi = centroids[best_label]
+        centroid_px = (int(cx_roi) + x1, int(cy_roi) + y1)  # back to full-frame coords
+
+        return {
+            "vx_px": vx_px,
+            "vy_px": vy_px,
+            "centroid_px": centroid_px,
+            "area_px": best_area,
+        }
+
+    def estimate_wrist_velocity_regression(self):
+        """
+        Estimates the wrist's 3D velocity (camera frame) via a least-squares linear
+        fit of position vs. time over self.wrist_position_history_cam, rather than a
+        single frame-to-frame difference. This is far less sensitive to a single noisy
+        pose-detection sample and reduces lag compared to a plain EMA, matching the
+        approach already used in speed_det_node.py.
+
+        Returns (vx, vy, vz) in the camera frame, or None if not enough samples.
+        """
+        history = self.wrist_position_history_cam
+        if len(history) < 2:
+            return None
+
+        t = np.array([s[0] for s in history])
+        t = t - t[0]  # numerical stability
+        xs = np.array([s[1][0] for s in history])
+        ys = np.array([s[1][1] for s in history])
+        zs = np.array([s[1][2] for s in history])
+
+        # np.polyfit(degree=1) returns [slope, intercept]; slope = velocity
+        try:
+            vx = float(np.polyfit(t, xs, 1)[0])
+            vy = float(np.polyfit(t, ys, 1)[0])
+            vz = float(np.polyfit(t, zs, 1)[0])
+        except np.linalg.LinAlgError:
+            return None
+
+        return vx, vy, vz
+
+    def update_wrist_relative_tracking(self, holding_arm, cv_depth_image, prev_gray, curr_gray, dt, curr_stamp, annotated_image):
+        """
+        Suit l'objet via un cluster de flux optique autour du poignet.
+        Le relâcher (THROW) est déclenché uniquement quand la distance 3D
+        entre le cluster et le poignet dépasse max_dist_meter.
+        """
+        throw_triggered = False
+        release_state = None
+
+        if holding_arm is None or self.prev_gray is None or dt <= 0:
+            return throw_triggered, release_state
+
+        wx, wy = holding_arm["wrist"]
+        wrist_pos_cam = self.get_wrist_position_3d(wx, wy, cv_depth_image)
+        if wrist_pos_cam is None:
+            return throw_triggered, release_state
+
+        # --- 1. Build / refresh the wrist-centered ROI ---
+        if self.hold_roi_half_size is None:
+            if self.last_valid_bbox is not None:
+                bx1, by1, bx2, by2 = self.last_valid_bbox
+                bbox_span = max(bx2 - bx1, by2 - by1)
+            else:
+                bbox_span = 60
+            self.hold_roi_half_size = int(bbox_span * self.wrist_roi_radius_ratio)
+
+        h_frame, w_frame = curr_gray.shape[:2]
+        r = self.hold_roi_half_size
+        roi_x1 = max(0, wx - r)
+        roi_y1 = max(0, wy - r)
+        roi_x2 = min(w_frame, wx + r)
+        roi_y2 = min(h_frame, wy + r)
+        self.hold_roi = (roi_x1, roi_y1, roi_x2, roi_y2)
+
+        band_thickness_arm = int(self.mask_thickness_arm * (2 * r))
+        band_thickness_hand = int(self.mask_thickness_hand * (2 * r))
+        hold_arm_mask = self.build_arm_exclusion_mask(
+            (h_frame, w_frame), holding_arm, band_thickness_arm, band_thickness_hand
+        )
+
+        if self.annotations_mode:
+            cv2.rectangle(annotated_image, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 180, 255), 1)
+
+        # --- 2. Detect the moving cluster (candidate object) inside the ROI ---
+        cluster = self.detect_moving_cluster_in_roi(prev_gray, curr_gray, self.hold_roi, hold_arm_mask)
+
+        if cluster is None:
+            self.missed_cluster_count += 1
+            if self.missed_cluster_count >= self.max_missed_cluster_frames:
+                self.divergence_count = 0
+            return throw_triggered, release_state
+
+        self.missed_cluster_count = 0
+
+        cx_px, cy_px = cluster["centroid_px"]
+        cluster_depth = self.estimate_object_depth_in_roi(
+            cv_depth_image, self.hold_roi, hold_arm_mask, wrist_pos_cam[2]
+        )
+        if cluster_depth is None:
+            return throw_triggered, release_state
+
+        cluster_vel_cam = self.pixel_flow_to_velocity(
+            cluster["vx_px"], cluster["vy_px"], wrist_pos_cam[2], cluster_depth, dt
+        )
+        if cluster_vel_cam is None:
+            return throw_triggered, release_state
+
+        cluster_pos_cam = (
+            ((cx_px - self.cx) * cluster_depth) / self.fx,
+            ((cy_px - self.cy) * cluster_depth) / self.fy,
+            cluster_depth,
+        )
+
+        if self.annotations_mode:
+            cv2.circle(annotated_image, (cx_px, cy_px), 6, (0, 128, 255), -1)
+            cv2.putText(annotated_image, "cluster", (cx_px + 8, cy_px),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 128, 255), 1)
+
+        # --- 3. Compare the cluster against the wrist: divergence = release ---
+        pos_diff = float(np.linalg.norm(np.array(cluster_pos_cam) - np.array(wrist_pos_cam)))
+
+        # SÉCURITÉ ANTI-TÉLÉPORTATION : 
+        # Si la distance saute à une valeur absurde (> 40 cm), c'est une erreur de profondeur (fond de la pièce).
+        # On ne déclenche pas le lancer, on ignore ce cluster.
+        max_valid_throw_distance = 0.40 # 40 cm maximum pour qu'un lancer soit jugé "crédible"
+        
+        if pos_diff > max_valid_throw_distance:
+            self.get_logger().debug(
+                f"Cluster ignoré : distance absurde de {pos_diff:.3f}m. "
+                f"Le capteur de profondeur a probablement accroché l'arrière-plan."
+            )
+            self.missed_cluster_count += 1
+            if self.missed_cluster_count >= self.max_missed_cluster_frames:
+                self.divergence_count = 0
+            return throw_triggered, release_state
+
+        # NOUVEAU CRITÈRE : Uniquement basé sur la distance max_dist_meter
+        is_diverging = (pos_diff > self.max_dist_meter)
+
+        self.last_cluster_state = {
+            "pos_cam": cluster_pos_cam,
+            "vel_cam": cluster_vel_cam,
+        }
+
+        if is_diverging:
+            self.divergence_count += 1
+            self.get_logger().info(
+                f"Cluster/wrist divergence: pos_diff={pos_diff:.3f} m "
+                f"(Threshold: {self.max_dist_meter}m) "
+                f"({self.divergence_count}/{self.divergence_confirm_frames})"
+            )
+        else:
+            self.divergence_count = 0
+
+        if self.divergence_count >= self.divergence_confirm_frames:
+            throw_triggered = True
+            x_rob, y_rob, z_rob = self.transform_position_to_robot(*cluster_pos_cam)
+            vx_rob, vy_rob, vz_rob = self.transform_velocity(*cluster_vel_cam, self.R_cam_to_robot)
+            release_state = {
+                "pos_cam": cluster_pos_cam,
+                "pos_rob": (x_rob, y_rob, z_rob),
+                "vel_cam": cluster_vel_cam,
+                "vel_rob": (vx_rob, vy_rob, vz_rob),
+            }
+            self.get_logger().info(
+                f"THROW DETECTED (Max distance exceeded). Measured release velocity "
+                f"(robot frame): vx={vx_rob:.2f}, vy={vy_rob:.2f}, vz={vz_rob:.2f} m/s"
+            )
+
+        return throw_triggered, release_state
+ 
+    def process_thrown_object(self, curr_gray, cv_depth_image, dt, annotated_image, curr_stamp):
         """
         Runs every frame while tracking_state == 'THROWN'. Computes optical flow
-        in the current ROI, estimates 3D velocity, and propagates the ROI for
-        the next frame (naive translation for now).
+        in the current ROI, estimates 3D velocity, updates Kalman Filter, and
+        centers the ROI on the projected Kalman position.
         """
         if self.flow_roi is None or self.prev_gray is None or dt <= 0:
+            self.tracking_state = 'IDLE'
             return
 
+        time_since_throw = curr_stamp - self.throw_start_time if self.throw_start_time else 0.0
+
+        # 1. Global Timeout Exit Condition
+        if time_since_throw > 2.0:
+            self.get_logger().info("End of throw (Timeout 2s). Reverting to IDLE.")
+            self.tracking_state = 'IDLE'
+            return
+
+        # Always predict the Kalman step to maintain state continuity across time
+        self.kalman_predict(dt)
+
+        # 2. Optical Flow Computation
         flow_result = self.compute_optical_flow_in_roi(
             self.prev_gray, curr_gray, self.flow_roi, self.flow_arm_mask
         )
         if flow_result is None:
-            self.get_logger().warn("Optical flow computation failed in ROI - skipping this frame.")
+            self.get_logger().warn("Optical flow computation failed in ROI - relying on KF prediction.")
             return
 
         vx_px, vy_px = flow_result
-
         depth_prev = self.flow_object_depth
 
+        # 3. Depth Estimation with time-scaled outlier filter
         depth_estimate = self.estimate_object_depth_in_roi(
             cv_depth_image, self.flow_roi, self.flow_arm_mask, self.flow_object_depth
         )
-        depth_curr = depth_estimate if depth_estimate is not None else depth_prev
+        max_allowed_z_jump = self.max_valid_speed * dt  # Dynamically bound max Z displacement
+        
+        if depth_estimate is not None and abs(depth_estimate - depth_prev) <= max_allowed_z_jump:
+            depth_curr = depth_estimate
+        else:
+            depth_curr = depth_prev
+
+        # 4. Exit Condition: Object too close to camera
+        if depth_curr <= self.min_valid_z + 0.02:
+            self.get_logger().info(f"End of throw (Depth lost/too close: {depth_curr:.2f}m). Reverting to IDLE.")
+            self.tracking_state = 'IDLE'
+            return
 
         velocity = self.pixel_flow_to_velocity(vx_px, vy_px, depth_prev, depth_curr, dt)
         if velocity is None:
-            self.kalman_predict(dt)
             return
 
         vx_cam_m, vy_cam_m, vz_cam_m = velocity
         self.flow_object_depth = depth_curr
 
-        self.get_logger().info(
-            f"Optical flow velocity estimate: vx={vx_cam_m:.2f} m/s, vy={vy_cam_m:.2f} m/s, vz={vz_cam_m:.2f} m/s | "
-            f"depth={self.flow_object_depth:.2f} m"
-        )
-
-        # Kalman filter update steps:
-        
-        # Predict the next state based on the elapsed time dt (Ballistic physics)
-        self.kalman_predict(dt)
-
-        # Transform the observed velocity into the robot frame
-        # We use self.R_cam_to_robot and the existing transform_velocity function
+        # 5. Transform velocity to robot coordinate frame
         vx_rob, vy_rob, vz_rob = self.transform_velocity(vx_cam_m, vy_cam_m, vz_cam_m, self.R_cam_to_robot)
+        flow_speed = np.sqrt(vx_rob**2 + vy_rob**2 + vz_rob**2)
+        min_trusted_flow_speed = 0.3
 
-        # Update the Kalman filter with the new velocity measurement in the robot frame
-        self.kalman_update_velocity(vx_rob, vy_rob, vz_rob)
+        # Update KF measurement if outside grace period and within plausible speeds
+        if (time_since_throw >= self.velocity_grace_period_s and min_trusted_flow_speed < flow_speed <= self.max_valid_speed):
+            self.kalman_update_velocity(vx_rob, vy_rob, vz_rob)
+        else:
+            self.get_logger().warn(f"Rejected flow velocity during grace/outlier check: {flow_speed:.2f} m/s")
 
-        # Extract the smoothed/predicted position for display (Robot frame)
-        kf_x_rob = float(self.kf_x[0])
-        kf_y_rob = float(self.kf_x[1])
-        kf_z_rob = float(self.kf_x[2])
+        kf_x_rob, kf_y_rob, kf_z_rob = float(self.kf_x[0]), float(self.kf_x[1]), float(self.kf_x[2])
 
         self.get_logger().info(
-            f"KF Position (Robot): x={kf_x_rob:.2f}, y={kf_y_rob:.2f}, z={kf_z_rob:.2f} | "
-            f"Flow Vel (Robot): vx={vx_rob:.2f}, vy={vy_rob:.2f}, vz={vz_rob:.2f}"
+            f"KF Pos (Robot): x={kf_x_rob:.2f}, y={kf_y_rob:.2f}, z={kf_z_rob:.2f} | "
+            f"KF Vel (Robot): vx={float(self.kf_x[3]):.2f}, vy={float(self.kf_x[4]):.2f}, vz={float(self.kf_x[5]):.2f} | "
+            f"Flow Vel measured: vx={vx_rob:.2f}, vy={vy_rob:.2f}, vz={vz_rob:.2f}"
         )
 
-        # Naive ROI propagation: shift by the measured pixel flow, same size for now
-        x1, y1, x2, y2 = self.flow_roi
-        dx, dy = int(round(vx_px)), int(round(vy_px))
-        h_frame, w_frame = curr_gray.shape[:2]
+        # 6. Exit Condition: Ground Impact
+        if time_since_throw > 0.15 and kf_z_rob <= -0.85:
+            self.get_logger().info(f"End of throw (Ground reached: Z_robot={kf_z_rob:.2f}m). Reverting to IDLE.")
+            self.tracking_state = 'IDLE'
+            return
 
-        new_x1 = max(0, min(x1 + dx, w_frame - 1))
-        new_y1 = max(0, min(y1 + dy, h_frame - 1))
-        new_x2 = max(new_x1 + 1, min(x2 + dx, w_frame))
-        new_y2 = max(new_y1 + 1, min(y2 + dy, h_frame))
-        self.flow_roi = (new_x1, new_y1, new_x2, new_y2)
-
-        if self.annotations_mode:
-            cv2.rectangle(annotated_image, (new_x1, new_y1), (new_x2, new_y2), (255, 0, 255), 2)
-            cv2.putText(annotated_image, "FLOW ROI", (new_x1, new_y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-
-        # Display the Kalman filter's predicted position in the camera frame
+        # 7. Feedback Loop: Re-center ROI using KF Projection
         x_cam_kf, y_cam_kf, z_cam_kf = self.transform_position_to_camera(kf_x_rob, kf_y_rob, kf_z_rob)
         uv_kf = self.project_3d_to_pixel(x_cam_kf, y_cam_kf, z_cam_kf)
 
-        if uv_kf is not None and self.annotations_mode:
+        if uv_kf is not None:
             u, v = uv_kf
-            cv2.circle(annotated_image, (u, v), 10, (0, 165, 255), -1)
-            cv2.putText(annotated_image, "KF", (u + 15, v),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            h_frame, w_frame = curr_gray.shape[:2]
+
+            # Ensure projected point lies within valid image bounds
+            if 0 <= u < w_frame and 0 <= v < h_frame:
+                x1, y1, x2, y2 = self.flow_roi
+                roi_w, roi_h = x2 - x1, y2 - y1
+
+                # Center ROI without collapsing dimensions near edges
+                new_x1 = max(0, min(u - roi_w // 2, w_frame - roi_w))
+                new_y1 = max(0, min(v - roi_h // 2, h_frame - roi_h))
+                new_x2 = min(w_frame, new_x1 + roi_w)
+                new_y2 = min(h_frame, new_y1 + roi_h)
+
+                self.flow_roi = (new_x1, new_y1, new_x2, new_y2)
+
+                if self.annotations_mode:
+                    cv2.rectangle(annotated_image, (new_x1, new_y1), (new_x2, new_y2), (255, 0, 255), 2)
+                    cv2.putText(annotated_image, "FLOW ROI", (new_x1, max(15, new_y1 - 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                    cv2.circle(annotated_image, (u, v), 8, (0, 165, 255), -1)
+                    cv2.putText(annotated_image, "KF", (u + 12, v),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            else:
+                self.get_logger().info("End of throw (Object moved outside image boundary). Reverting to IDLE.")
+                self.tracking_state = 'IDLE'
+        else:
+            self.get_logger().info("End of throw (Object behind camera). Reverting to IDLE.")
+            self.tracking_state = 'IDLE'
 
     def build_camera_to_robot_rotation(self, roll_deg, tilt_deg):
         """
@@ -674,7 +1007,7 @@ class OpticalTrackingNode(Node):
 
             # Measurement noise matrix R_vel
             # The optical flow measurement can be noisy, so we assign a moderate uncertainty to it.
-            R_vel = np.eye(3) * 0.5 
+            R_vel = np.eye(3) * 2.0
 
             # Kalman filter update equations
             y = Z - (H_vel @ self.kf_x)                     # Innovation (prediction error)
@@ -885,10 +1218,10 @@ class OpticalTrackingNode(Node):
                     break  # Un objet tenu trouvé, on arrête de chercher
 
             if is_held_global:
-                self.get_logger().info(f"Object held by {best_holding_arm['side']} arm (distance: {best_holding_arm_dist:.3f} m).")
+                self.get_logger().debug(f"Object held by {best_holding_arm['side']} arm (distance: {best_holding_arm_dist:.3f} m).")
 
-            # 2. Mettre à jour la machine d'état UNE SEULE FOIS par frame, en dehors de la boucle
-            throw_triggered = self.update_throw_detection(
+            # 2. Mettre à jour la transition IDLE -> HOLDING (bootstrap via YOLO-World)
+            self.update_throw_detection(
                 is_held=is_held_global, 
                 holding_arm=best_holding_arm, 
                 object_center_meters=best_obj_center_meters, 
@@ -900,9 +1233,40 @@ class OpticalTrackingNode(Node):
                 curr_stamp=curr_stamp
             )
 
+            throw_triggered = False
+            release_state = None
+
+            # 2bis. Tant qu'on est en HOLDING, le suivi et la détection de relâcher se
+            # font en continu via le flux optique relatif au poignet (indépendant de la
+            # détection YOLO-World de l'objet, souvent perdue à cause du flou de mouvement).
+            if self.tracking_state == 'HOLDING' and self.last_holding_arm is not None and self.prev_gray is not None:
+                # Retrouver le poignet correspondant au bras qui tient l'objet dans la
+                # frame courante (position à jour, indépendante de la détection objet).
+                current_holding_arm = next(
+                    (arm for arm in valid_arms if arm["side"] == self.last_holding_arm["side"]),
+                    None
+                )
+                if current_holding_arm is not None:
+                    throw_triggered, release_state = self.update_wrist_relative_tracking(
+                        holding_arm=current_holding_arm,
+                        cv_depth_image=cv_depth_image,
+                        prev_gray=self.prev_gray,
+                        curr_gray=curr_gray,
+                        dt=dt,
+                        curr_stamp=curr_stamp,
+                        annotated_image=annotated_image,
+                    )
+                    if throw_triggered:
+                        self.tracking_state = 'THROWN'
+                        self.throw_start_time = curr_stamp
+                        # Use the freshest arm pose (current frame) for the post-throw
+                        # exclusion mask, rather than the one captured at grasp time.
+                        self.last_holding_arm = current_holding_arm
+
             if throw_triggered:
-                # Préparation du flux optique au moment du lancer
-                self.init_optical_flow_roi()
+                # Préparation du flux optique au moment du lancer, avec la position/vitesse
+                # mesurées directement sur l'amas de pixels divergent (release_state)
+                self.init_optical_flow_roi(cv_depth_image, release_state=release_state)
                 if self.annotations_mode and self.flow_roi is not None:
                     rx1, ry1, rx2, ry2 = self.flow_roi
                     cv2.rectangle(annotated_image, (rx1, ry1), (rx2, ry2), (255, 0, 255), 2)
@@ -930,7 +1294,7 @@ class OpticalTrackingNode(Node):
 
             # 4. Continuer le tracking du flot optique si relâché
             if self.tracking_state == 'THROWN':
-                self.process_thrown_object(curr_gray, cv_depth_image, dt, annotated_image)
+                self.process_thrown_object(curr_gray, cv_depth_image, dt, annotated_image, curr_stamp)
 
             if self.annotations_mode:
                 if self.tracking_state == 'HOLDING':

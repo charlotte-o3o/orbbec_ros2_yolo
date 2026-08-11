@@ -14,7 +14,7 @@ services:
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-      - DEPLOYMENT_ENV=${DEPLOYMENT_ENV:-local}
+      - DEPLOYMENT_ENV=${DEPLOYMENT_ENV}
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
 
@@ -30,6 +30,7 @@ services:
     # Monte le code source pour itérer sans tout reconstruire
     volumes:
       - ./src:/ros2_orbbec_ws/src
+      - ./config:/ros2_orbbec_ws/config
       - ./weights:/ros2_orbbec_ws/weights
       - ./data:/root/ros2_orbbec_ws/data
       - /tmp/.docker.xauth:/tmp/.docker.xauth:ro

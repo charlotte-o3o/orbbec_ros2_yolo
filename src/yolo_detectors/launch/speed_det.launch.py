@@ -24,16 +24,18 @@ def generate_launch_description():
         ),
 
         # --- Détection de pose (publie /yolo_detected_poses) ---
-        Node(
-            package='yolo_detectors',
-            executable='yolo_pose',
-            name='yolo_pose_node',
-            output='screen',
-            parameters=[config_file],
-        ),
+        # Plus utilisée par la détection de lancer : le nœud reste disponible
+        # (executable 'yolo_pose') mais n'est plus lancé.
+        # Node(
+        #     package='yolo_detectors',
+        #     executable='yolo_pose',
+        #     name='yolo_pose_node',
+        #     output='screen',
+        #     parameters=[config_file],
+        # ),
 
-        # --- Détection de lancer basée sur la vitesse : dépend des 2 nœuds ci-dessus ---
-        # ---           (synchronise image + depth + detections + poses)              ---
+        # --- Détection de lancer basée sur la vitesse : dépend du nœud ci-dessus ---
+        # ---   (consomme /yolo_detected_objects ; aucune image sauf en record)    ---
         Node(
             package='yolo_detectors',
             executable='speed_det',

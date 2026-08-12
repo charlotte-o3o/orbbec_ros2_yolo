@@ -9,6 +9,7 @@ fine_tune_yolo_node:
         # 0 = level, 90/180/270 = counter-clockwise rotation applied before YOLO.
         input_rotation_deg: 90
 
+# yolo_pose_node n'est plus lancé par speed_det.launch.py (voir le launch file).
 yolo_pose_node:
     ros__parameters:
         model_path: 'weights/yolo26n-pose.pt'
@@ -17,8 +18,9 @@ yolo_pose_node:
 speed_det_node:
     ros__parameters:
         save_distance_mode: false
-        record_mode: True
-        annotations_mode: true
+        # ON => abonnement à l'image couleur + synchro + annotations + encodage.
+        # Les plots de trajectoire sont sauvegardés dans tous les cas.
+        record_mode: true
         alpha_smooth: 0.4
         cooldown_duration: 5.0
         speed_threshold: 1.5
@@ -37,7 +39,7 @@ speed_det_node:
         effective_gravity: 9.81
 
         # Gripper opening sent in the reach command packet.
-        reach_aperture: 0.15
+        reach_aperture: 0.1
 
         # Robot capture box, in ROBOT-frame metres (x forward, y left, z up). The axis
         # swaps you had noted are folded in: old x -> y, old y -> z, old z -> x.

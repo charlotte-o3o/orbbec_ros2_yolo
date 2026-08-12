@@ -2,24 +2,20 @@ import os
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, message="Unable to import Axes3D")
-os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;*.warning=false"
 
 import rclpy
 from rclpy.node import Node
-from rclpy.duration import Duration
 from rclpy.qos import qos_profile_sensor_data
-from lancer_interfaces.msg import HumanPoseArray
 import message_filters
 from vision_msgs.msg import Detection2DArray
-from cv_bridge import CvBridge
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Float32MultiArray
-from geometry_msgs.msg import PointStamped
+from cv_bridge import CvBridge
+from collections import deque
+import cv2
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import cv2
-import random
 import csv
 import time
 import numpy as np
@@ -38,12 +34,6 @@ class SpeedDetNode(Node):
 
         self.get_logger().info("*** Speed Based Throw Detection Node Launched ***")
 
-        self.bridge = CvBridge()
-
-        self.box_color         = (random.randint(0,255), random.randint(0,255), random.randint(0,255))   
-        self.right_wrist_color = (241, 255, 81)
-        self.left_wrist_color  = (218, 110, 255)
-
         ######################################################################
         #          CAMERA PARAMETERS (to be updated from CameraInfo)         #
         ######################################################################
@@ -51,7 +41,7 @@ class SpeedDetNode(Node):
         self.fps_camera      = 30.0
         self.fx              = 616.0  # Focal length in pixels (x-axis)
         self.fy              = 616.0  # Focal length in pixels (y-axis)
-        self.cx              = 320.0  # Principal point x-coordinate (image center)      
+        self.cx              = 320.0  # Principal point x-coordinate (image center)
         self.cy              = 240.0  # Principal point y-coordinate (image center)
         self.has_camera_info = False
 
@@ -121,15 +111,15 @@ class SpeedDetNode(Node):
         ######################################################################
         #                        DATA LOGGING SETUP                          #
         ######################################################################
-        
+
         if self.save_distance_mode:
             self.get_logger().info("Distances save mode ON.")
             self.distance_log_dir = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "speed_detection", "csv_distances")
             if not os.path.exists(self.distance_log_dir):
                 os.makedirs(self.distance_log_dir)
-                self.get_logger().info(f"Directory created: {self.distance_log_dir}")                     
-            self.csv_path = os.path.join(self.distance_log_dir,                   
-                                    f"distances_{self.timestamp_csv}.csv")         
+                self.get_logger().info(f"Directory created: {self.distance_log_dir}")
+            self.csv_path = os.path.join(self.distance_log_dir,
+                                    f"distances_{self.timestamp_csv}.csv")
 
             self.csv_file = open(self.csv_path, mode='w', newline='')
             self.csv_writer = csv.writer(self.csv_file)
@@ -140,17 +130,6 @@ class SpeedDetNode(Node):
 
         else:
             self.get_logger().info("Distances save mode OFF.")
-
-        if self.record_mode:
-            self.get_logger().info("Record mode ON.")
-            self.video_writer = None
-            self.video_folder = "data/captures_videos"       
-            if not os.path.exists(self.video_folder):
-                os.makedirs(self.video_folder)
-                self.get_logger().info(f"Recording directory created : {self.video_folder}")
-
-        else:
-            self.get_logger().info("Record mode OFF.")
 
         ######################################################################
         #                INTERNAL TRACKING STATUSES & COUNTERS               #
@@ -221,51 +200,64 @@ class SpeedDetNode(Node):
             qos_profile=qos_profile_sensor_data
         )
 
-        self.sub_image          = message_filters.Subscriber(
-            self,
-            Image,
-            '/orbbec_external/color/image_raw',
-            qos_profile=qos_profile_sensor_data
-        )
+        # The estimator itself runs entirely on the 3D points carried by the detections:
+        # no image, depth or pose stream is needed for it. The colour image is only
+        # subscribed to when recording is asked for, and it is then time-synchronised
+        # with the detections so the overlay matches the frame it is drawn on.
+        if self.record_mode:
+            self.get_logger().info("Record mode ON: one clip per throw.")
+            self.bridge = CvBridge()
+            self.video_folder = "data/captures_videos"
+            if not os.path.exists(self.video_folder):
+                os.makedirs(self.video_folder)
+                self.get_logger().info(f"Recording directory created : {self.video_folder}")
 
-        self.sub_depth          = message_filters.Subscriber(
-            self,
-            Image, 
-            '/orbbec_external/depth/image_raw',
-            qos_profile=qos_profile_sensor_data
-        )
+            # Per-throw clip state. `clip_writer` only exists between the start of a
+            # throw and the stop condition that ends it.
+            self.clip_writer   = None
+            self.clip_path     = None
+            self.clip_active   = False
+            self.clip_frames   = 0
+            self.preroll       = deque(maxlen=max(1, int(self.record_preroll_seconds * self.fps_camera)))
 
-        self.sub_fine_tune_yolo = message_filters.Subscriber(
-            self,
-            Detection2DArray,
-            '/yolo_detected_objects'
-        )
+            self.sub_image          = message_filters.Subscriber(
+                self,
+                Image,
+                '/orbbec_external/color/image_raw',
+                qos_profile=qos_profile_sensor_data
+            )
 
-        self.sub_yolo_pose      = message_filters.Subscriber(
-            self,
-            HumanPoseArray,
-            '/yolo_detected_poses'
-        )
+            self.sub_fine_tune_yolo = message_filters.Subscriber(
+                self,
+                Detection2DArray,
+                '/yolo_detected_objects'
+            )
 
-        ######################################################################
-        #                          SYNCHRONIZER                              #
-        ######################################################################
+            self.sync = message_filters.ApproximateTimeSynchronizer(
+                [self.sub_image, self.sub_fine_tune_yolo],
+                queue_size=10,
+                slop=0.1
+            )
 
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [self.sub_image, self.sub_depth, self.sub_fine_tune_yolo, self.sub_yolo_pose],
-            queue_size=10,
-            slop=0.1
-        )
+            self.sync.registerCallback(self.synchronized_callback)
 
-        self.sync.registerCallback(self.synchronized_callback)
+        else:
+            self.get_logger().info("Record mode OFF.")
+
+            self.sub_fine_tune_yolo = self.create_subscription(
+                Detection2DArray,
+                '/yolo_detected_objects',
+                self.detections_callback,
+                10
+            )
 
     def camera_info_callback(self, msg: CameraInfo):
 
         if not self.has_camera_info:
             self.fx = msg.k[0]
-            self.fy = msg.k[4] 
+            self.fy = msg.k[4]
             self.cx = msg.k[2]
-            self.cy = msg.k[5] 
+            self.cy = msg.k[5]
             self.has_camera_info = True
 
             self.get_logger().info(f"Camera info received: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
@@ -352,7 +344,7 @@ class SpeedDetNode(Node):
 
     def is_valid_object_position(self, position_meters):
         """
-        Checks that the 3D position (x, y, z) in meters is physically 
+        Checks that the 3D position (x, y, z) in meters is physically
         plausible before using it to anchor a trajectory.
         """
         if position_meters is None or None in position_meters:
@@ -375,7 +367,7 @@ class SpeedDetNode(Node):
     ######################################################################
     #                        TRAJECTORY PREDICTION                       #
     ######################################################################
-    
+
     def predict_smoothed_trajectory(self, t_since_start, dt_frame, g_const=9.81):
         """
         Computes the smoothed predictive future trajectory using least squares polynomial fitting (polyfit)
@@ -395,15 +387,15 @@ class SpeedDetNode(Node):
         zs = np.array([p[3] for p in active_points])
 
         # Linear regression (degree 1) for X and Z (constant velocity)
-        poly_x = np.polyfit(ts, xs, 1) 
+        poly_x = np.polyfit(ts, xs, 1)
         poly_z = np.polyfit(ts, zs, 1)
-        
+
         # Gravitational adjustment of Y (Y-axis positive upwards)
         ys_adjusted = ys + 0.5 * g_const * (ts ** 2)
         poly_y = np.polyfit(ts, ys_adjusted, 1)
 
         vx_moy = poly_x[0]
-        vy_moy = poly_y[0] - g_const * t_since_start 
+        vy_moy = poly_y[0] - g_const * t_since_start
         vz_moy = poly_z[0]
 
         # If the object is not moving towards the workspace (moving away or flat), prediction is invalid
@@ -570,100 +562,49 @@ class SpeedDetNode(Node):
         # No trajectory point intersects the workspace cube
         return False, None, None, None, None
 
-    def synchronized_callback(self, color_msg, depth_msg, yolo_objects, yolo_poses):
-        try: 
-            annotated_image = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
-            cv_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+    ######################################################################
+    #                            CALLBACKS                               #
+    ######################################################################
 
-            if annotated_image is not None:
-                h_color, w_color = annotated_image.shape[:2]
-            if cv_depth_image is not None:
-                h, w = cv_depth_image.shape[:2]
+    def detections_callback(self, yolo_objects):
+        """Fast path: no image stream at all, detections drive the estimator."""
+        self.process_detections(yolo_objects, None)
 
+    def synchronized_callback(self, color_msg, yolo_objects):
+        """Recording path: same estimator, plus an annotated frame written to disk."""
+        frame = None
+        try:
+            frame = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().warn(f"Could not convert the colour frame for recording : {e}")
+
+        self.process_detections(yolo_objects, frame)
+
+    def process_detections(self, yolo_objects, frame):
+        try:
             object_center_pixels = None
-            lw_pixels = None
-            rw_pixels = None
             object_center_meters = None
-            rx, ry, rz = None, None, None
+            object_speed_m_s = 0.0
+            vrx, vry, vrz = 0.0, 0.0, 0.0
+            dt = None
 
             ######################################################################
-            #                          PROCESSING OF                             #
-            #                   YOLO DETECTIONS AND POSES                        #
-            ######################################################################           
+            #                     PROCESSING OF YOLO DETECTIONS                  #
+            ######################################################################
 
             for detection in yolo_objects.detections:
-                x_center = detection.bbox.center.position.x
-                y_center = detection.bbox.center.position.y
-                size_x = detection.bbox.size_x
-                size_y = detection.bbox.size_y
-                object_center_pixels = (int(x_center), int(y_center))
-
-                x1 = int(x_center - size_x / 2)
-                y1 = int(y_center - size_y / 2)
-                x2 = int(x_center + size_x / 2)
-                y2 = int(y_center + size_y / 2)
-
-                if self.annotations_mode:
-                    #cv2.rectangle(annotated_image, (x1, y1), (x2, y2), self.box_color, 2)
-                    cv2.circle(annotated_image, (int(x_center), int(y_center)), 8, self.box_color, -1)
+                object_center_pixels = (int(detection.bbox.center.position.x),
+                                        int(detection.bbox.center.position.y))
 
                 if len(detection.results) > 0:
                     result = detection.results[0]
-                    
+
                     if result.pose.pose.position.z >= 0.1:
-                        object_center_meters = (result.pose.pose.position.x, 
-                                                result.pose.pose.position.y, 
+                        object_center_meters = (result.pose.pose.position.x,
+                                                result.pose.pose.position.y,
                                                 result.pose.pose.position.z)
                     else:
                         object_center_meters = None
-
-                for result in detection.results:
-                    label = result.hypothesis.class_id
-                    conf = result.hypothesis.score * 100
-                    
-                    if self.annotations_mode:
-                        custom_label = f"{label} ({conf:.1f}%) | Z: {object_center_meters[2]:.3f}m" if object_center_meters is not None else f"{label} ({conf:.1f}%)"
-                        cv2.putText(annotated_image, custom_label, (x1, y1 - 10),                                 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, self.box_color, 2)                     
-                
-            for pose in yolo_poses.poses:
-                kpts = pose.keypoints
-                if len(kpts) > 9 and kpts[9].confidence > 0.7 and cv_depth_image is not None:
-                    lw_x = int(kpts[9].x)
-                    lw_y = int(kpts[9].y)
-                    lw_x = max(0, min(lw_x, w - 1))
-                    lw_y = max(0, min(lw_y, h - 1))
-                    lw_pixels = (lw_x, lw_y)
-
-                    if self.annotations_mode:
-                        cv2.circle(annotated_image, (lw_x, lw_y), 8, self.left_wrist_color, -1)
-                        cv2.putText(annotated_image, "LEFT WRIST", (lw_x + 10, lw_y + 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, self.left_wrist_color, 3)
-
-                if len(kpts) > 10 and kpts[10].confidence > 0.7 and cv_depth_image is not None:
-                    rw_x = int(kpts[10].x)
-                    rw_y = int(kpts[10].y)
-                    rw_x = max(0, min(rw_x, w - 1))
-                    rw_y = max(0, min(rw_y, h - 1))
-                    rw_pixels = (rw_x, rw_y)
-
-                    if self.annotations_mode:
-                        cv2.circle(annotated_image, (rw_x, rw_y), 8, self.right_wrist_color, -1)
-                        cv2.putText(annotated_image, "RIGHT WRIST", (rw_x + 10, rw_y + 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, self.right_wrist_color, 3)
-
-            if object_center_pixels is not None and None not in object_center_pixels:
-                hold_connections = []
-                
-                if lw_pixels is not None and None not in lw_pixels:
-                    hold_connections.append((object_center_pixels, lw_pixels))
-                    
-                if rw_pixels is not None and None not in rw_pixels:
-                    hold_connections.append((object_center_pixels, rw_pixels))
-
-                if self.annotations_mode:
-                    for pt1, pt2 in hold_connections:
-                        cv2.line(annotated_image, pt1, pt2, (0, 255, 255), 2)
 
             ######################################################################
             #                         THROW DETECTION                            #
@@ -673,10 +614,6 @@ class SpeedDetNode(Node):
             object_speed_csv = 0.0
             remaining_time = self.startup_grace_period - current_timestamp
 
-            if remaining_time > 0 and self.annotations_mode:
-                cv2.putText(annotated_image, f"WARMING UP ({remaining_time:.1f}s)", (30, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 165, 255), 3)
-
             # Defined up-front so the CSV block below cannot raise NameError on frames where
             # no object was tracked (e.g. during warm-up, or when the detection is dropped).
             rx = ry = rz = None
@@ -684,10 +621,7 @@ class SpeedDetNode(Node):
 
             if object_center_meters is not None and None not in object_center_meters:
                 rx, ry, rz = object_center_meters
-                object_speed_m_s = 0.0
-                vrx, vry, vrz = 0.0, 0.0, 0.0
-                dt = None
-                
+
                 if self.smoothed_object_meters is None:
                     self.smoothed_object_meters = list(object_center_meters)
                 else:
@@ -713,18 +647,14 @@ class SpeedDetNode(Node):
                         vrz = (current_world_pos[2] - self.last_world_pos[2]) / dt
 
                         # Compute the overall speed of the object in meters per second
-                        object_speed_m_s = (vrx**2 + vry**2 + vrz**2)**0.5 
+                        object_speed_m_s = (vrx**2 + vry**2 + vrz**2)**0.5
 
-                        if self.annotations_mode:
-                            cv2.putText(annotated_image, f"Speed: {object_speed_m_s:.2f} m/s", (30, 100),                                        
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-                            
                     else:
                         self.get_logger().warn("Cannot compute speed: dt too small or negative.")
-                                        
+
                 self.last_world_pos = list(current_world_pos)
                 self.last_timestamp = current_timestamp
-                object_speed_csv = round(object_speed_m_s, 4) 
+                object_speed_csv = round(object_speed_m_s, 4)
 
                 if remaining_time <= 0:
                     if object_speed_m_s >= self.speed_threshold and vrz < 0:
@@ -733,18 +663,14 @@ class SpeedDetNode(Node):
                         self.throw_confirm_counter += 1
 
                         if self.throw_confirm_counter >= self.throw_confirm_frames:
-                            # The object has been moving fast enough for enough 
+                            # The object has been moving fast enough for enough
                             # consecutive frames to confirm a throw
                             self.false_frame_counter = 0
                             self.throw_detected = True
-
-                            if self.annotations_mode:
-                                        cv2.putText(annotated_image, f"THROW", (30, 50),                                        
-                                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-                    # if remaining_time <= 0 but not (object_speed_m_s >= self.speed_threshold and vrz < 0):        
-                    else:   
+                    # if remaining_time <= 0 but not (object_speed_m_s >= self.speed_threshold and vrz < 0):
+                    else:
                         self.throw_confirm_counter = 0
-                        self.false_frame_counter += 1                    
+                        self.false_frame_counter += 1
                         if self.false_frame_counter >= self.max_false_frames_allowed:
                             # The object has been moving too slowly or getting farther from the camera
                             # for too many consecutive frames, so we reset the throw detection
@@ -754,39 +680,34 @@ class SpeedDetNode(Node):
                     time_since_last_throw = current_timestamp - self.last_throw_trigger_time
 
                     if time_since_last_throw >= self.cooldown_duration:
-                        self.last_throw_trigger_time = current_timestamp 
+                        self.last_throw_trigger_time = current_timestamp
 
                         if self.is_valid_object_position(object_center_meters):
                             self.throw_coordinates = current_world_pos
 
-                            if self.annotations_mode:
-                                coord_text = f"Obj: X:{rx_world:.3f}m, Y:{ry_world:.3f}m, Z:{rz_world:.3f}m"
-                                cv2.putText(annotated_image, coord_text, (30, h_color - 50),                                            
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1, self.box_color, 2)
-
                             # Start trajectory tracking
                             self.trajectory_tracking_active = True
                             self.trajectory_start_time = current_timestamp
-                            self.trajectory_start_frame = self.frame_count 
+                            self.trajectory_start_frame = self.frame_count
                             # Uncomment the following line to include the first observed point in the trajectory
-                            self.trajectory_observed = [(0.0,) + tuple(self.throw_coordinates)] 
+                            self.trajectory_observed = [(0.0,) + tuple(self.throw_coordinates)]
                             # Uncomment the following line to not include the first observed point in the trajectory
-                            # (we could want to anchor to the second point of the throw as the first point uses 
+                            # (we could want to anchor to the second point of the throw as the first point uses
                             # raw data that is potentially noisy)
-                            #self.trajectory_observed = []  
+                            #self.trajectory_observed = []
                             self.trajectory_history = []
                             self.predicted_trajectory = None
                             self.last_history_sample_time = None
                             self.landing_confirm_counter = 0
 
                             self.get_logger().info(f"Throw started (vrz = {vrz:.3f}m/s): trajectory prediction start !\n")
-                        
+
                         else:
-                            # The object is moving fast enough but its position is not 
+                            # The object is moving fast enough but its position is not
                             # physically plausible (e.g., Z < 0.1m or Z > 10m)
                             self.throw_coordinates = None
                             self.get_logger().warn("Throw detected but the object is invisible or its position is not physically plausible (rejected).")
-                                
+
                     else:
                         # The object is moving fast enough but the cooldown period has not yet elapsed
                         self.get_logger().info(f"Flickering detected ! New initial point blocked by cooldown ({self.cooldown_duration - time_since_last_throw:.1f}s left)")
@@ -809,8 +730,8 @@ class SpeedDetNode(Node):
                 # Check if the object position is valid and if we have a previous position to compute speed
                 elif (self.is_valid_object_position(object_center_meters)
                       and self.previous_object_center_meters is not None
-                      and self.previous_object_timestamp is not None):   
-                    
+                      and self.previous_object_timestamp is not None):
+
                     if object_speed_m_s > self.max_valid_speed:
                         # The object speed is too high to be physically plausible
                         self.get_logger().warn(
@@ -828,30 +749,30 @@ class SpeedDetNode(Node):
                         if self.trajectory_observed:
                             last_recorded_t = self.trajectory_observed[-1][0]
                             time_gap = t_since_start - last_recorded_t
-                            # Detect temporary tracking loss ("black hole") if no 
+                            # Detect temporary tracking loss ("black hole") if no
                             # observations were recorded for over 500ms
-                            if time_gap > 0.50:  
+                            if time_gap > 0.50:
                                 stop_reason = f"Trajectory tracking aborted: black hole detected ({time_gap:.2f}s without valid updates)."
                                 self.trajectory_tracking_active = False
 
                         # Store the current valid 3D point in world coordinates
                         if stop_reason is None:
                             self.trajectory_observed.append((
-                                t_since_start, 
-                                rx_world, 
-                                ry_world, 
+                                t_since_start,
+                                rx_world,
+                                ry_world,
                                 rz_world
                             ))
 
-                        # Re-calculate predictive trajectory every 2 frames 
+                        # Re-calculate predictive trajectory every 2 frames
                         # once at least 4 points have been collected
                         if len(self.trajectory_observed) >= 4 and len(self.trajectory_observed) % 2 == 0:
-                           
+
                             dt_frame = dt if dt is not None else (1.0 / self.fps_camera)
                             raw_trajectory, vx_moy, vy_moy, vz_moy = self.predict_smoothed_trajectory(t_since_start, dt_frame, g_const=self.effective_gravity)
 
                             if raw_trajectory is None:
-                                # If prediction fails due to non-approaching velocity, 
+                                # If prediction fails due to non-approaching velocity,
                                 # discard the last anomalous point
                                 if vz_moy >= self.non_approaching_velocity_threshold:
                                     self.get_logger().warn(
@@ -911,7 +832,7 @@ class SpeedDetNode(Node):
 
                         time_tracked = current_timestamp - self.trajectory_start_time
 
-                        # Check if object has arrived close enough to camera 
+                        # Check if object has arrived close enough to camera
                         # (landing threshold) after minimum allowed tracking time
                         if rz < self.landing_z_threshold and time_tracked >= self.min_time_before_landing_check:
                             self.landing_confirm_counter += 1
@@ -921,7 +842,7 @@ class SpeedDetNode(Node):
                         # Stop tracking when landing is confirmed over N consecutive frames
                         if self.landing_confirm_counter >= self.landing_confirm_frames:
                             stop_reason = f"Object has reached the camera (Z={rz:.3f}m < {self.landing_z_threshold}m, confirmed)."
-                    
+
                     else:
                         # Reject trajectory update if approach speed towards the camera is too small
                         self.get_logger().warn("Cannot update trajectory : vz too small")
@@ -945,89 +866,97 @@ class SpeedDetNode(Node):
             if self.is_valid_object_position(object_center_meters):
                 self.previous_object_center_meters = object_center_meters
                 self.previous_object_timestamp = current_timestamp
-                    
-            cv2.putText(annotated_image, f"Frame {self.frame_count}", (1150, 50),                                            
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
-            if self.last_throw_trigger_time > 0.0:
-                time_since_last_throw = current_timestamp - self.last_throw_trigger_time
-                remaining_cooldown = self.cooldown_duration - time_since_last_throw
-
-                if remaining_cooldown > 0 and self.annotations_mode:
-                    text_cooldown = f"CD: {remaining_cooldown:.1f}s"
-                    
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 2.2 
-                    thickness = 6
-                    color_orange = (0, 140, 255) 
-                    
-                    text_size, _ = cv2.getTextSize(text_cooldown, font, font_scale, thickness)
-                    text_w, text_h = text_size
-                    
-                    pos_x = w_color - text_w - 40
-                    pos_y = h_color - 40
-                    
-                    cv2.putText(annotated_image, text_cooldown, (pos_x, pos_y), 
-                                font, font_scale, color_orange, thickness)
 
             # Write 3D trajectory and tracking status to CSV file if distance logging mode is enabled
-            if self.save_distance_mode:        
+            if self.save_distance_mode:
                 x_csv = round(rx_world, 4) if rx_world is not None else ""
                 y_csv = round(ry_world, 4) if ry_world is not None else ""
                 z_csv = round(rz_world, 4) if rz_world is not None else ""
                 self.csv_writer.writerow([self.frame_count, round(current_timestamp, 4), x_csv, y_csv, z_csv, object_speed_csv, self.throw_detected])
-                if self.frame_count % 30 == 0: 
+                if self.frame_count % 30 == 0:
                     self.csv_file.flush()
 
             # Record annotated video frames if recording mode is enabled
-            if self.record_mode:
-                if self.video_writer is None:
-                    self.record_path = os.path.join(self.video_folder,                   
-                                f"{self.timestamp_csv}_speed_det.avi")                                     
-                    fourcc = cv2.VideoWriter_fourcc(*'MJPG')                    
-                    self.video_writer = cv2.VideoWriter(self.record_path, fourcc, self.fps_camera, (w_color, h_color))
-                    self.get_logger().info(f"Recording started.")
-                
-                if self.video_writer is not None:
-                    self.video_writer.write(annotated_image)
-            
+            if self.record_mode and frame is not None:
+                self.record_frame(frame, object_center_pixels, object_speed_m_s,
+                                  remaining_time, (rx_world, ry_world, rz_world),
+                                  current_timestamp)
 
             self.frame_count += 1
 
-            #cv2.putText(annotated_image, "Press ECHAP to quit", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            cv2.imshow("Throw Detection With Object Speed", annotated_image)
-            
-            key = cv2.waitKey(1) & 0xFF
-
-            # Exit execution if ESC key (ASCII 27) is pressed
-            if key == 27:
-                self.get_logger().info("ECHAP pressed. Shutting down the node...")
-                raise KeyboardInterrupt
-    
-        except KeyboardInterrupt:
-            raise
-
         except Exception as e:
-            self.get_logger().info(f"Error in the synchronized callback : {e}")
+            self.get_logger().info(f"Error in the detections callback : {e}")
+
+    ######################################################################
+    #                        OPTIONAL RECORDING                          #
+    ######################################################################
+
+    def record_frame(self, frame, object_center_pixels, object_speed_m_s,
+                     remaining_time, world_pos, current_timestamp):
+        """
+        Draw the debug overlay and push the frame to the video file.
+
+        Only reached when `record_mode` is on: nothing here runs on the default path.
+        """
+        h_color, w_color = frame.shape[:2]
+
+        if object_center_pixels is not None:
+            cv2.circle(frame, object_center_pixels, 8, (0, 255, 255), -1)
+
+        if remaining_time > 0:
+            cv2.putText(frame, f"WARMING UP ({remaining_time:.1f}s)", (30, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 165, 255), 3)
+        elif self.throw_detected:
+            cv2.putText(frame, "THROW", (30, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+
+        cv2.putText(frame, f"Speed: {object_speed_m_s:.2f} m/s", (30, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+
+        rx_world, ry_world, rz_world = world_pos
+        if rx_world is not None:
+            cv2.putText(frame, f"Obj: X:{rx_world:.3f}m, Y:{ry_world:.3f}m, Z:{rz_world:.3f}m",
+                        (30, h_color - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+
+        cv2.putText(frame, f"Frame {self.frame_count}", (w_color - 250, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        if self.last_throw_trigger_time > 0.0:
+            remaining_cooldown = self.cooldown_duration - (current_timestamp - self.last_throw_trigger_time)
+
+            if remaining_cooldown > 0:
+                text_cooldown = f"CD: {remaining_cooldown:.1f}s"
+                font, font_scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 2.2, 6
+                (text_w, _), _ = cv2.getTextSize(text_cooldown, font, font_scale, thickness)
+                cv2.putText(frame, text_cooldown, (w_color - text_w - 40, h_color - 40),
+                            font, font_scale, (0, 140, 255), thickness)
+
+        if self.video_writer is None:
+            self.record_path = os.path.join(self.video_folder,
+                                            f"{self.timestamp_csv}_speed_det.avi")
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            self.video_writer = cv2.VideoWriter(self.record_path, fourcc, self.fps_camera, (w_color, h_color))
+            self.get_logger().info(f"Recording started.")
+
+        self.video_writer.write(frame)
 
     def destroy_node(self):
             """
-            Safely cleanup resources, flush log files, release video writers, 
+            Safely cleanup resources, flush log files, release video writers,
             and save partial plot figures when shutting down the node.
             """
-            if getattr(self, 'trajectory_tracking_active', False) and self.trajectory_observed:           
+            if getattr(self, 'trajectory_tracking_active', False) and self.trajectory_observed:
                 self.get_logger().info("\nNode shutting down with an active throw: saving partial trajectory plot...")
                 self.trajectory_tracking_active = False
                 self.plot_trajectory_history()
 
-            if hasattr(self, 'video_writer') and self.video_writer is not None:
+            if getattr(self, 'video_writer', None) is not None:
                 self.video_writer.release()
                 self.get_logger().info(f"\nRecord video saved : {self.record_path}")
 
             if hasattr(self, 'csv_file') and self.csv_file is not None and not self.csv_file.closed:
                 self.csv_file.close()
                 self.get_logger().info("\nCSV file flushed and closed correctly.")
-            cv2.destroyAllWindows()
             return super().destroy_node()
 
 def main(args=None):

@@ -1,11 +1,42 @@
-<?xml version="1.0" encoding="UTF-8" ?>
-<CycloneDDS>
-    <Domain>
-        <General>
-            <!-- TODO: remplacer par la vraie interface réseau du robot (ex: eth0, wlan0)
-                 Vérifier avec `ip addr` sur la machine cible -->
-            <NetworkInterfaceAddress>enp134s0</NetworkInterfaceAddress>
-            <AllowMulticast>true</AllowMulticast>
-        </General>
-    </Domain>
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS xmlns="https://cdds.io/config">
+
+  <!-- images: camera <-> tracker, host-local only -->
+  <Domain id="42">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="lo" multicast="false"/>
+      </Interfaces>
+      <AllowMulticast>false</AllowMulticast>
+      <MaxMessageSize>65500B</MaxMessageSize>
+      <FragmentSize>65000B</FragmentSize>
+    </General>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>10</MaxAutoParticipantIndex>
+      <Peers>
+        <Peer address="127.0.0.1"/>
+      </Peers>
+    </Discovery>
+    <Internal>
+      <SocketReceiveBufferSize min="64MB"/>
+    </Internal>
+  </Domain>
+
+  <!-- robot: controller <-> G1, over the direct cable -->
+  <Domain id="0">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="enp134s0"/>
+      </Interfaces>
+    </General>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>120</MaxAutoParticipantIndex>
+      <Peers>
+        <Peer address="192.168.123.164"/>
+      </Peers>
+    </Discovery>
+  </Domain>
+
 </CycloneDDS>

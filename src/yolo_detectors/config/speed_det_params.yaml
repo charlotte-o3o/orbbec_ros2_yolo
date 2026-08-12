@@ -36,13 +36,6 @@ speed_det_node:
         # a proper rotation, so this is the true value.
         effective_gravity: 9.81
 
-        # World -> robot transform, read from TF once at startup. world_frame_id must match
-        # the child_frame_id of the TF you publish; robot_frame_id is its parent, and is the
-        # frame the capture box below and the /reach_command target are expressed in.
-        robot_frame_id: torso_link
-        world_frame_id: orbbec_external_link
-        tf_lookup_timeout: 10.0
-
         # Gripper opening sent in the reach command packet.
         reach_aperture: 0.15
 

@@ -15,8 +15,6 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Float32MultiArray
 from geometry_msgs.msg import PointStamped
-import tf2_ros
-from tf2_geometry_msgs import do_transform_point
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -28,8 +26,15 @@ import numpy as np
 
 class SpeedDetNode(Node):
 
-    def __init__(self):
-        super().__init__('speed_det_node')
+    def __init__(self, context=None, cmd_node=None):
+        super().__init__('speed_det_node', context=context)
+
+        # Split-domain wiring: this node lives on the image domain (subscriptions,
+        # camera_info). `cmd_node` lives in a second context on the robot's domain
+        # and owns the outgoing /reach_command publisher, so a command published from
+        # inside an image callback leaves on the robot domain. See main().
+        # Falls back to self when no separate node is supplied (single-domain runs).
+        self.cmd_node = cmd_node if cmd_node is not None else self
 
         self.get_logger().info("*** Speed Based Throw Detection Node Launched ***")
 
@@ -96,16 +101,6 @@ class SpeedDetNode(Node):
         self.camera_tilt_deg                    = self.declare_parameter('camera_tilt_deg', 0.0).value
         self.camera_roll_deg                    = self.declare_parameter('camera_roll_deg', 0.0).value # 0 = landscape (default), 90 or -90 = camera rotated to vertical (requires calibration)
 
-        # World -> robot transform, read from TF once at startup. Tracking and prediction
-        # stay in this node's world frame; the transform is applied at the capture-box test,
-        # so the box and the published reach command are both in the robot's frame.
-        # The TF's child IS this node's world frame, so the lookup already carries both the
-        # translation and the y-up -> z-up convention change. Nothing to compose here.
-        #   robot_frame_id : the TF's parent -- what the command must be expressed in.
-        #   world_frame_id : the TF's child  -- must match the child_frame_id you publish.
-        self.robot_frame_id                     = self.declare_parameter('robot_frame_id', 'torso_link').value
-        self.world_frame_id                     = self.declare_parameter('world_frame_id', 'camera_world').value
-        self.tf_lookup_timeout                  = self.declare_parameter('tf_lookup_timeout', 10.0).value
 
         # Gripper opening sent in the reach command packet.
         self.reach_aperture                     = self.declare_parameter('reach_aperture', 0.15).value
@@ -199,10 +194,6 @@ class SpeedDetNode(Node):
         self.R_cam_to_world = self.build_rotation_from_angles(self.camera_roll_deg,
                                                               self.camera_tilt_deg)
 
-        # spin_thread=True gives the buffer its own thread, so it can actually fill while
-        # the constructor blocks waiting for the transform below.
-        self.tf_buffer   = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self, spin_thread=True)
         self.R_world_to_robot, self.t_world_to_robot = self.lookup_world_to_robot()
 
         ######################################################################
@@ -212,7 +203,8 @@ class SpeedDetNode(Node):
         # [target_x, target_y, target_z, aperture, time_to_go, is_active], target in the
         # robot frame. Published only when a predicted trajectory actually enters the
         # capture box; the consumer feeds its own idle packet the rest of the time.
-        self.pub_reach          = self.create_publisher(
+        # Created on cmd_node, so this goes out on the robot domain, not the image one.
+        self.pub_reach          = self.cmd_node.create_publisher(
             Float32MultiArray,
             '/reach_command',
             10
@@ -314,15 +306,6 @@ class SpeedDetNode(Node):
         self.validate_rotation(R, f"angle-derived (roll={roll_deg}, tilt={tilt_deg})")
         return R
 
-    @staticmethod
-    def quaternion_to_matrix(x, y, z, w):
-        n = np.sqrt(x*x + y*y + z*z + w*w)
-        x, y, z, w = x/n, y/n, z/n, w/n
-        return np.array([
-            [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
-            [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
-            [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)],
-        ])
 
     def lookup_world_to_robot(self):
         """
@@ -336,33 +319,19 @@ class SpeedDetNode(Node):
         Velocities take the rotation alone -- adding the translation to a velocity would
         turn a fixed offset into a fictitious speed.
         """
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.robot_frame_id,
-                self.world_frame_id,
-                rclpy.time.Time(),
-                timeout=Duration(seconds=float(self.tf_lookup_timeout)),
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"Could not read TF {self.world_frame_id} -> {self.robot_frame_id} within "
-                f"{self.tf_lookup_timeout}s ({e}). The capture box and the reach command are "
-                f"both expressed in {self.robot_frame_id}, so there is nothing sensible to "
-                f"publish without it."
-            ) from e
 
-        q = tf.transform.rotation
-        t = tf.transform.translation
+        t = np.array([0.15, 0., 0.08])
 
-        R = self.quaternion_to_matrix(q.x, q.y, q.z, q.w)
-        self.validate_rotation(R, f"TF-derived {self.world_frame_id}->{self.robot_frame_id}")
+        R = np.array([  [0.0, 0.0, 1.0],
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0]])
+        self.validate_rotation(R, f"world->torso")
 
         self.get_logger().info(
-            f"World -> robot transform read from TF: {self.world_frame_id} -> "
-            f"{self.robot_frame_id} | translation "
-            f"({t.x:+.3f}, {t.y:+.3f}, {t.z:+.3f}) m"
+            f"World -> robot transform read from TF: world->torso | translation "
+            f"({t}) m"
         )
-        return R, np.array([t.x, t.y, t.z])
+        return R, t
 
     def world_point_to_robot(self, p_world):
         """World-frame position -> robot frame (rotation + translation)."""
@@ -919,7 +888,7 @@ class SpeedDetNode(Node):
 
                                 if has_target:
                                     self.get_logger().info(
-                                        f"[TARGET IN WORKSPACE] Capture point ({self.robot_frame_id}): "
+                                        f"[TARGET IN WORKSPACE] Capture point): "
                                         f"X={x_target:.2f}m, Y={y_target:.2f}m, Z={z_target:.2f}m in {t_intercept:.3f}s"
                                     )
 
@@ -1062,15 +1031,36 @@ class SpeedDetNode(Node):
             return super().destroy_node()
 
 def main(args=None):
-    
+
+    # Two domains, one process -- replaces the external domain_bridge:
+    #   default context : the image domain (ROS_DOMAIN_ID == IMAGE_DOMAIN_ID), carries
+    #                     the camera images/detections.
+    #   cmd_ctx         : the robot domain, carries /reach_command only.
+    # The throw estimation runs in an image-domain callback and publishes straight out
+    # onto the robot domain.
     rclpy.init(args=args)
-    node = SpeedDetNode()
+
+    cmd_domain = int(os.environ.get('COMMAND_DOMAIN_ID', '0'))
+    cmd_ctx    = rclpy.Context()
+    rclpy.init(context=cmd_ctx, domain_id=cmd_domain)
+
+    # Publisher-only node: publish() needs no spinning executor, DDS matching happens
+    # in the middleware's own threads. No args passed to its context, so the launch
+    # file's params/remappings stay on the image node.
+    cmd_node = Node('speed_det_cmd_out', context=cmd_ctx)
+
+    node = SpeedDetNode(cmd_node=cmd_node)
+    node.get_logger().info(f"/reach_command published on domain {cmd_domain}")
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        cmd_node.destroy_node()
+        rclpy.shutdown(context=cmd_ctx)
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

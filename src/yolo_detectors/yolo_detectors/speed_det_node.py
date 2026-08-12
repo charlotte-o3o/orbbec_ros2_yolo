@@ -7,6 +7,7 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;*.warning=false"
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.qos import qos_profile_sensor_data
 from lancer_interfaces.msg import HumanPoseArray
 import message_filters
 from vision_msgs.msg import Detection2DArray
@@ -225,19 +226,21 @@ class SpeedDetNode(Node):
             CameraInfo,
             '/orbbec_external/color/camera_info',
             self.camera_info_callback,
-            10
+            qos_profile=qos_profile_sensor_data
         )
 
         self.sub_image          = message_filters.Subscriber(
             self,
             Image,
-            '/orbbec_external/color/image_raw'
+            '/orbbec_external/color/image_raw',
+            qos_profile=qos_profile_sensor_data
         )
 
         self.sub_depth          = message_filters.Subscriber(
             self,
             Image, 
-            '/orbbec_external/depth/image_raw'
+            '/orbbec_external/depth/image_raw',
+            qos_profile=qos_profile_sensor_data
         )
 
         self.sub_fine_tune_yolo = message_filters.Subscriber(

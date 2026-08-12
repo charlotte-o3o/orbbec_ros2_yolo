@@ -5,6 +5,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message="Unable to impor
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;*.warning=false"
 
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 import message_filters
 from sensor_msgs.msg import CameraInfo, Image
 import rclpy
@@ -83,19 +84,21 @@ class FineTuneYoloNode(Node):
             CameraInfo,
             '/orbbec_external/color/camera_info',
             self.camera_info_callback,
-            10
+            qos_profile=qos_profile_sensor_data
         )
 
         self.sub_color = message_filters.Subscriber(
             self,
             Image, 
-            '/orbbec_external/color/image_raw'
+            '/orbbec_external/color/image_raw',
+            qos_profile=qos_profile_sensor_data
         )
         
         self.sub_depth = message_filters.Subscriber(
             self,
             Image, 
-            '/orbbec_external/depth/image_raw'
+            '/orbbec_external/depth/image_raw',
+            qos_profile=qos_profile_sensor_data
         )
 
         self.pub_detections = self.create_publisher(

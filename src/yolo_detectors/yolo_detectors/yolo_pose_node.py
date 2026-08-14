@@ -108,37 +108,50 @@ class YoloPoseNode(Node):
             cv_color_image = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
             cv_depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
 
+            h_orig, w_orig = cv_color_image.shape[:2]
+
+            # --- 1. REDRESSEMENT DE L'IMAGE POUR YOLO ---
+            cv_color_upright = cv2.rotate(cv_color_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
             start_time = time.perf_counter()
-            results = self.model(cv_color_image, stream=True, verbose=False, conf=self.confidence_threshold)           
+            results = self.model(cv_color_upright, stream=True, verbose=False, conf=self.confidence_threshold)           
             results = list(results)
             end_time = time.perf_counter() 
 
             inference_time = (end_time - start_time) * 1000
             fps = 1000.0 / inference_time if inference_time > 0 else 0.0
 
+            # L'annotation s'effectue sur l'image native
             annotated_image = cv_color_image.copy()
 
             boxes = results[0].boxes
             keypoints_object = results[0].keypoints
             num_persons = len(boxes) if boxes is not None else 0
 
-            # Hauteur et largeur de l'image de profondeur pour éviter les débordements de pixels
+            # Hauteur et largeur de l'image de profondeur native
             h, w = cv_depth_image.shape[:2]
 
             msg_pose_array = HumanPoseArray()
-            msg_pose_array.header = color_msg.header # Copie du timestamp de synchronisation
+            msg_pose_array.header = color_msg.header
             
             if boxes is not None and keypoints_object is not None and cv_depth_image is not None:
 
-                kpts = keypoints_object.data.cpu().numpy()
+                kpts_upright = keypoints_object.data.cpu().numpy()
 
                 for i, _ in enumerate(boxes):
 
-                    if i >= len(kpts):
+                    if i >= len(kpts_upright):
                         continue
 
-                    person_kpts = kpts[i]
+                    # --- 2. CONVERSION INVERSE DES KEYPOINTS (Upright -> Native) ---
+                    person_kpts = np.zeros_like(kpts_upright[i])
+                    for kp_idx, (x_up, y_up, conf) in enumerate(kpts_upright[i]):
+                        # Transformation pour cv2.ROTATE_90_COUNTERCLOCKWISE
+                        x_native = w_orig - y_up
+                        y_native = x_up
+                        person_kpts[kp_idx] = [x_native, y_native, conf]
 
+                    # --- 3. DESSIN & CALCULS SUR IMAGE NATIVE ---
                     for pt1_idx, pt2_idx in self.skeleton_connections:
                         x1, y1, conf1 = person_kpts[pt1_idx]
                         x2, y2, conf2 = person_kpts[pt2_idx]
@@ -150,7 +163,7 @@ class YoloPoseNode(Node):
 
                     for kp in person_kpts:
                         kp_x, kp_y, kp_conf = kp
-                        if kp_conf > 0.5:  # Seuil de confiance pour afficher le point
+                        if kp_conf > 0.5:
                             cv2.circle(annotated_image, (int(kp_x), int(kp_y)), 4, self.circle_color, -1)
 
                     x_l_shoulder, y_l_shoulder, conf_l = person_kpts[5] # Épaule gauche
@@ -176,19 +189,17 @@ class YoloPoseNode(Node):
                         text_coord = "X: ---, Y: ---, Z: ---"
 
                     human_pose_msg = HumanPose()
-                    human_pose_msg.id = int(i) # ID de la personne détectée
+                    human_pose_msg.id = int(i)
 
-                    # Remplissage du centre 3D de l'humain (X, Y, Z en mètres)
                     human_pose_msg.position_centre_3d.x = float(x_meters) if x_meters is not None else 0.0
                     human_pose_msg.position_centre_3d.y = float(y_meters) if y_meters is not None else 0.0  
                     human_pose_msg.position_centre_3d.z = float(distance_box_m)
 
-                    # Remplissage de TOUS les 17 keypoints de la personne dans la liste
                     for kp in person_kpts:
                         kp_msg = Keypoint2D()
                         kp_msg.x = float(kp[0])
                         kp_msg.y = float(kp[1])
-                        kp_msg.confidence = float(kp[2]) # Score d'invisibilité/visibilité du point
+                        kp_msg.confidence = float(kp[2])
                         human_pose_msg.keypoints.append(kp_msg)
 
                     msg_pose_array.poses.append(human_pose_msg)

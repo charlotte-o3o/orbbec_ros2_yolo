@@ -2,9 +2,11 @@
 *.avi
 yolo26n.pt
 yolov8s-world.pt
+yoloe-26s-seg.pt
 stgcn_lancer.pt
 books.pt
 *.pth
+*.ts
 
 # Python files
 __pycache__/
@@ -47,3 +49,4 @@ src/g1_arm_control/
 Log/
 data/
 .vscode/
+*.ts

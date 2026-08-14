@@ -1,10 +1,10 @@
 fine_tune_yolo_node:
     ros__parameters:
-        model_path: 'weights/milk_bottle_v1.pt'
-        confidence: 0.50
+        model_path: 'weights/yellow_box_v2.pt'
+        confidence: 0.750
         max_history: 5
         max_jump: 2.0
-        bb_margin: 0.48
+        bb_margin: 0.495
 
 yolo_pose_node:
     ros__parameters:
@@ -14,8 +14,8 @@ yolo_pose_node:
 speed_det_node:
     ros__parameters:
         save_distance_mode: false
-        record_mode: True
-        annotations_mode: false
+        record_mode: true
+        annotations_mode: true
         alpha_smooth: 0.4
         cooldown_duration: 5.0
         speed_threshold: 1.5

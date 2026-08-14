@@ -22,8 +22,8 @@ class FineTuneYoloNode(Node):
     def __init__(self):
         super().__init__('fine_tune_yolo_node')
 
-        self.declare_parameter('model_path',  'weights/milk_bottle_v1.pt')
-        self.declare_parameter('confidence',  0.50)
+        self.declare_parameter('model_path',  'weights/yellow_box_v2.pt')
+        self.declare_parameter('confidence',  0.750)
         self.declare_parameter('max_history', 5)
         self.declare_parameter('max_jump',    2.0)
         self.declare_parameter('bb_margin',   0.46)

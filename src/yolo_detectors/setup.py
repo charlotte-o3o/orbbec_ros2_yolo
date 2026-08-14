@@ -33,7 +33,8 @@ setup(
             'mathematical_throw_detection = yolo_detectors.mathematical_throw_detection_node:main',
             'lstm = yolo_detectors.lstm_node:main',
             'speed_det = yolo_detectors.speed_det_node:main',
-            'optical_tracking = yolo_detectors.optical_tracking_node:main'
+            'optical_tracking = yolo_detectors.optical_tracking_node:main',
+            'yoloe = yolo_detectors.yoloe_node:main',
         ],
     },
 )

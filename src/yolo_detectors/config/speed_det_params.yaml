@@ -1,10 +1,10 @@
 fine_tune_yolo_node:
     ros__parameters:
-        model_path: 'weights/alien_plushie_v5.pt'
+        model_path: 'weights/milk_bottle_v1.pt'
         confidence: 0.50
         max_history: 5
         max_jump: 2.0
-        bb_margin: 0.46
+        bb_margin: 0.48
 
 yolo_pose_node:
     ros__parameters:
@@ -15,7 +15,7 @@ speed_det_node:
     ros__parameters:
         save_distance_mode: false
         record_mode: True
-        annotations_mode: true
+        annotations_mode: false
         alpha_smooth: 0.4
         cooldown_duration: 5.0
         speed_threshold: 1.5

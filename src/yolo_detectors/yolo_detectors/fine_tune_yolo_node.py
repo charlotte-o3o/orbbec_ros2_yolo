@@ -22,7 +22,7 @@ class FineTuneYoloNode(Node):
     def __init__(self):
         super().__init__('fine_tune_yolo_node')
 
-        self.declare_parameter('model_path',  'weights/alien_plushie_v5.pt')
+        self.declare_parameter('model_path',  'weights/milk_bottle_v1.pt')
         self.declare_parameter('confidence',  0.50)
         self.declare_parameter('max_history', 5)
         self.declare_parameter('max_jump',    2.0)
@@ -50,6 +50,10 @@ class FineTuneYoloNode(Node):
         self.consecutive_jumps = 0
         self.box_color = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
 
+        # --- Historique pour le temps d'inférence ---
+        self.inference_history = []
+        self.max_inference_samples = 1000
+
         self.last_valid_time = self.get_clock().now()
 
         self.get_logger().info("*** YOLO Node Launched successfully ***")
@@ -57,7 +61,8 @@ class FineTuneYoloNode(Node):
         self.get_logger().info(f"Model loading : {self.model_path}...")
         self.model = YOLO(self.model_path)
         self.get_logger().info("Model loaded successfully")
-        
+
+        self.get_logger().info(f"BoundingBox margin : {self.bb_margin}")
 
         self.sub_info = self.create_subscription(
             CameraInfo,
@@ -122,12 +127,32 @@ class FineTuneYoloNode(Node):
 
             start_time = time.perf_counter()
             # Inférence de YOLO sur l'image redressée
-            results = self.model(cv_color_upright, stream=True, verbose=False, conf=self.confidence_threshold)           
+            results = self.model(cv_color_image, stream=True, verbose=False, conf=self.confidence_threshold)           
             results = list(results)
             end_time = time.perf_counter() 
 
             inference_time = (end_time - start_time) * 1000
             fps = 1000.0 / inference_time if inference_time > 0 else 0.0
+
+            # --- Enregistrement dans l'historique ---
+            self.inference_history.append(inference_time)
+
+            # --- Dès qu'on atteint 1000 mesures ---
+            if len(self.inference_history) >= self.max_inference_samples:
+                mean_inference = sum(self.inference_history) / len(self.inference_history)
+                mean_fps = 1000.0 / mean_inference if mean_inference > 0 else 0.0
+
+                # Affichage dans le terminal via le logger ROS 2
+                self.get_logger().info(
+                    f"\n=========================================="
+                    f"\n [STATS INFERENCE] Moyenne sur {self.max_inference_samples} frames :"
+                    f"\n - Temps d'inférence moyen : {mean_inference:.2f} ms"
+                    f"\n - FPS moyen               : {mean_fps:.1f} FPS"
+                    f"\n=========================================="
+                )
+
+                # Réinitialisation de la liste pour les 1000 prochaines frames
+                self.inference_history.clear()
 
             # L'annotation s'effectue toujours sur l'image native (couchée)
             annotated_image = cv_color_image.copy()
@@ -144,9 +169,12 @@ class FineTuneYoloNode(Node):
                     class_id = int(box.cls[0])
                     label = self.model.names[class_id]
                     confidence = float(box.conf[0]) * 100
+
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])  
                     
                     # --- 2. COORDONNÉES DANS L'IMAGE REDRESSÉE ---
-                    x1_up, y1_up, x2_up, y2_up  = map(int, box.xyxy[0])
+                    #x1_up, y1_up, x2_up, y2_up  = map(int, box.xyxy[0])
+
 
                     # --- 3. CONVERSION INVERSE (Vers l'image native couchée) ---
                     # Formule pour cv2.ROTATE_90_CLOCKWISE :
@@ -155,15 +183,18 @@ class FineTuneYoloNode(Node):
                     #x2 = y2_up
                     #y2 = h_orig - x1_up
 
-                    # Si tu utilises cv2.ROTATE_90_COUNTERCLOCKWISE, remplace les 4 lignes ci-dessus par :
-                    x1 = w_orig - y2_up
-                    y1 = x1_up
-                    x2 = w_orig - y1_up
-                    y2 = x2_up
+                    # Si tu utilises cv2.ROTATE_90_COUNTERCLOCKWISE :
+                    # x1 = w_orig - y2_up
+                    # y1 = x1_up
+                    # x2 = w_orig - y1_up
+                    # y2 = x2_up
 
                     # Sécurité : forcer x1, y1 comme coin supérieur gauche
-                    x1, x2 = min(x1, x2), max(x1, x2)
-                    y1, y2 = min(y1, y2), max(y1, y2)
+                    #x1, x2 = min(x1, x2), max(x1, x2)
+                    #y1, y2 = min(y1, y2), max(y1, y2)
+                    x1, x2 = max(0, x1), min(w - 1, x2)
+                    y1, y2 = max(0, y1), min(h - 1, y2)
+
 
                     # --- SUITE DU CODE ORIGINAL ---
                     # Le reste de tes calculs de profondeur et d'affichage utilise 

@@ -56,8 +56,16 @@ class SpeedDetNode(Node):
 
         # Operating modes (Toggles / Flags)
         self.save_distance_mode                 = self.declare_parameter('save_distance_mode', False).value
-        self.record_mode                        = self.declare_parameter('record_mode', True).value
-        self.annotations_mode                   = self.declare_parameter('annotations_mode', True).value
+        # Off by default: turning it on adds a colour-image subscription, the
+        # time synchroniser, the annotation pass and the encoder to the hot path.
+        # The trajectory plots do not depend on it.
+        # One clip is written per throw, closed as soon as the throw ends, and named
+        # after the same start frame as the trajectory plot so the two pair up.
+        self.record_mode                        = self.declare_parameter('record_mode', False).value
+        # Seconds of frames kept in memory and prepended to each clip. A throw is only
+        # confirmed a few frames after it starts, so without this the clip opens with the
+        # object already in flight. Costs one frame buffer per 1/fps of pre-roll.
+        self.record_preroll_seconds             = self.declare_parameter('record_preroll_seconds', 0.5).value
 
         # Throw detection parameters
         self.alpha_smooth                       = self.declare_parameter('alpha_smooth', 0.4).value
@@ -112,9 +120,18 @@ class SpeedDetNode(Node):
         #                        DATA LOGGING SETUP                          #
         ######################################################################
 
+        # Single root for every artefact this node writes (CSV, plots, clips).
+        # MUST be absolute and under $HOME: docker-compose mounts the host's ./data on
+        # /root/ros2_orbbec_ws/data, while WORKDIR is /ros2_orbbec_ws. A relative "data/..."
+        # path therefore lands in the container's own layer and never reaches the host.
+        self.output_root = self.declare_parameter(
+            'output_root',
+            os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "speed_detection")
+        ).value
+
         if self.save_distance_mode:
             self.get_logger().info("Distances save mode ON.")
-            self.distance_log_dir = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "speed_detection", "csv_distances")
+            self.distance_log_dir = os.path.join(self.output_root, "csv_distances")
             if not os.path.exists(self.distance_log_dir):
                 os.makedirs(self.distance_log_dir)
                 self.get_logger().info(f"Directory created: {self.distance_log_dir}")
@@ -207,7 +224,7 @@ class SpeedDetNode(Node):
         if self.record_mode:
             self.get_logger().info("Record mode ON: one clip per throw.")
             self.bridge = CvBridge()
-            self.video_folder = "data/captures_videos"
+            self.video_folder = os.path.join(self.output_root, "captures_videos")
             if not os.path.exists(self.video_folder):
                 os.makedirs(self.video_folder)
                 self.get_logger().info(f"Recording directory created : {self.video_folder}")
@@ -215,6 +232,7 @@ class SpeedDetNode(Node):
             # Per-throw clip state. `clip_writer` only exists between the start of a
             # throw and the stop condition that ends it.
             self.clip_writer   = None
+            self.clip_basename = None
             self.clip_path     = None
             self.clip_active   = False
             self.clip_frames   = 0
@@ -505,7 +523,7 @@ class SpeedDetNode(Node):
 
         plt.tight_layout()
 
-        plot_dir = os.path.join(os.path.expanduser("~"), "ros2_orbbec_ws", "data", "speed_detection", "trajectory_plots")
+        plot_dir = os.path.join(self.output_root, "trajectory_plots")
         if not os.path.exists(plot_dir):
             os.makedirs(plot_dir)
         frame_tag = f"frame{self.trajectory_start_frame}" if self.trajectory_start_frame is not None else "frameUNK"
@@ -587,6 +605,7 @@ class SpeedDetNode(Node):
             object_speed_m_s = 0.0
             vrx, vry, vrz = 0.0, 0.0, 0.0
             dt = None
+            throw_finished = False
 
             ######################################################################
             #                     PROCESSING OF YOLO DETECTIONS                  #
@@ -699,6 +718,9 @@ class SpeedDetNode(Node):
                             self.predicted_trajectory = None
                             self.last_history_sample_time = None
                             self.landing_confirm_counter = 0
+
+                            if self.record_mode:
+                                self.start_clip()
 
                             self.get_logger().info(f"Throw started (vrz = {vrz:.3f}m/s): trajectory prediction start !\n")
 
@@ -859,6 +881,7 @@ class SpeedDetNode(Node):
                 # Finalize tracking session and save trajectory plots if any stop condition was met
                 if stop_reason is not None:
                     self.trajectory_tracking_active = False
+                    throw_finished = True
                     self.get_logger().info(stop_reason)
                     self.plot_trajectory_history()
 
@@ -876,11 +899,16 @@ class SpeedDetNode(Node):
                 if self.frame_count % 30 == 0:
                     self.csv_file.flush()
 
-            # Record annotated video frames if recording mode is enabled
+            # Record annotated video frames if recording mode is enabled. The frame that
+            # carried the stop condition still belongs to the throw, so it is written
+            # before the clip is closed.
             if self.record_mode and frame is not None:
                 self.record_frame(frame, object_center_pixels, object_speed_m_s,
                                   remaining_time, (rx_world, ry_world, rz_world),
                                   current_timestamp)
+
+            if self.record_mode and throw_finished:
+                self.close_clip()
 
             self.frame_count += 1
 
@@ -891,10 +919,67 @@ class SpeedDetNode(Node):
     #                        OPTIONAL RECORDING                          #
     ######################################################################
 
+    def start_clip(self):
+        """
+        Open a clip for the throw that just started.
+
+        The writer itself is created lazily in record_frame(), where the frame size is
+        known. Named after the same start frame as the trajectory plot so a clip and its
+        plot can be paired by filename.
+        """
+        if self.clip_active:
+            # A previous clip never got closed (should not happen); do not leak it.
+            self.close_clip()
+
+        frame_tag = f"frame{self.trajectory_start_frame}" if self.trajectory_start_frame is not None else "frameUNK"
+        # Extension left off: the encoder that actually opens decides it (see open_clip_writer).
+        self.clip_basename = os.path.join(self.video_folder,
+                                          f"{self.timestamp_csv}_{frame_tag}_speed_det")
+        self.clip_path   = None
+        self.clip_active = True
+        self.clip_frames = 0
+
+    def open_clip_writer(self, w_color, h_color):
+        """
+        Build the VideoWriter for the current clip.
+
+        Motion-JPEG in an AVI container. The files are large, but this is the one
+        encoder every OpenCV build ships and the one that actually plays back here:
+        the mp4v (MPEG-4 Part 2) clips this wrote previously would not open in the
+        local players. H.264, which would be the small and universally playable
+        option, is not compiled into this OpenCV -- see the avc1 probe.
+        """
+        path   = self.clip_basename + '.avi'
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        writer = cv2.VideoWriter(path, fourcc, self.fps_camera, (w_color, h_color))
+
+        if not writer.isOpened():
+            writer.release()
+            self.get_logger().error("MJPG encoder unavailable: this throw will not be recorded.")
+            return None
+
+        self.clip_path = path
+        return writer
+
+    def close_clip(self):
+        """Finalise the clip of the throw that just ended."""
+        self.clip_active = False
+
+        if self.clip_writer is not None:
+            self.clip_writer.release()
+            self.clip_writer = None
+            self.get_logger().info(f"\nThrow clip saved ({self.clip_frames} frames) : {self.clip_path}")
+        else:
+            self.get_logger().warn("Throw ended but no frame was recorded: clip not written.")
+
+        self.clip_frames = 0
+        self.preroll.clear()
+
     def record_frame(self, frame, object_center_pixels, object_speed_m_s,
                      remaining_time, world_pos, current_timestamp):
         """
-        Draw the debug overlay and push the frame to the video file.
+        Draw the debug overlay, then either buffer the frame as pre-roll or write it to
+        the clip of the throw currently in flight.
 
         Only reached when `record_mode` is on: nothing here runs on the default path.
         """
@@ -931,14 +1016,32 @@ class SpeedDetNode(Node):
                 cv2.putText(frame, text_cooldown, (w_color - text_w - 40, h_color - 40),
                             font, font_scale, (0, 140, 255), thickness)
 
-        if self.video_writer is None:
-            self.record_path = os.path.join(self.video_folder,
-                                            f"{self.timestamp_csv}_speed_det.avi")
-            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            self.video_writer = cv2.VideoWriter(self.record_path, fourcc, self.fps_camera, (w_color, h_color))
-            self.get_logger().info(f"Recording started.")
+        # Between throws the frames only feed the pre-roll ring buffer, so the clip can
+        # start slightly before the throw was confirmed.
+        if not self.clip_active:
+            self.preroll.append(frame)
+            return
 
-        self.video_writer.write(frame)
+        if self.clip_writer is None:
+            self.clip_writer = self.open_clip_writer(w_color, h_color)
+
+            if self.clip_writer is None:
+                # No encoder: stop trying for this throw rather than retrying every frame.
+                self.clip_active = False
+                self.preroll.clear()
+                return
+
+            self.get_logger().info(f"Recording throw clip : {self.clip_path}")
+
+            # Flush the pre-roll first, oldest frame first.
+            for buffered in self.preroll:
+                if buffered.shape[:2] == (h_color, w_color):
+                    self.clip_writer.write(buffered)
+                    self.clip_frames += 1
+            self.preroll.clear()
+
+        self.clip_writer.write(frame)
+        self.clip_frames += 1
 
     def destroy_node(self):
             """
@@ -950,9 +1053,9 @@ class SpeedDetNode(Node):
                 self.trajectory_tracking_active = False
                 self.plot_trajectory_history()
 
-            if getattr(self, 'video_writer', None) is not None:
-                self.video_writer.release()
-                self.get_logger().info(f"\nRecord video saved : {self.record_path}")
+            # Close the clip of a throw that was still in flight, so it stays playable.
+            if getattr(self, 'clip_writer', None) is not None:
+                self.close_clip()
 
             if hasattr(self, 'csv_file') and self.csv_file is not None and not self.csv_file.closed:
                 self.csv_file.close()

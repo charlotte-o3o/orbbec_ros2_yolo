@@ -19,8 +19,12 @@ speed_det_node:
     ros__parameters:
         save_distance_mode: false
         # ON => abonnement à l'image couleur + synchro + annotations + encodage.
+        # Un clip par lancer, fermé dès que le lancer se termine.
         # Les plots de trajectoire sont sauvegardés dans tous les cas.
         record_mode: true
+        # Secondes de frames gardées en mémoire et ajoutées au début de chaque clip
+        # (le lancer n'est confirmé qu'après quelques frames).
+        record_preroll_seconds: 0.5
         alpha_smooth: 0.4
         cooldown_duration: 5.0
         speed_threshold: 1.5
